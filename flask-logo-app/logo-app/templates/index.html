@@ -1,0 +1,36 @@
+<!DOCTYPE html>
+<head>
+  <title>OpenAI Logo Maker</title>
+  <link
+    rel="shortcut icon"
+    href="{{ url_for('static', filename='icon.jpg') }}"
+  />
+  <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}" />
+  <script src="https://code.jquery.com/jquery-3.7.0.min.js"></script>
+  <script type="text/javascript">
+    function loading(){
+      $(".loading").show();
+    }
+  </script>
+</head>
+
+<body>
+  <img src="{{ url_for('static', filename='icon.jpg') }}" class="icon" />
+  <h3>Generate a Lettermark logo</h3>
+  <form action="/" method="post">
+    <input type="text" name="color" placeholder="Enter the logo color, e.g. dark gold" required />
+    <input type="text" name="text" placeholder="Enter the brand name, e.g. Fast Delivery" required />
+    <input type="text" name="number" placeholder="How many proposals, e.g. 1,2,...,5" required />
+    <input type="submit" value="GENERATE LOGO" onclick="loading();" />
+  </form>
+  {% if result %}
+  <div class="result">
+    {%for i in result['data']%}
+      <img src={{i['url']}}>
+    {%endfor%}
+  </div>
+  {% endif %}
+  <div class="loading">
+    <img src="{{ url_for('static', filename='loading.jpg') }}" width="35" height="35">
+  </div>
+</body>
