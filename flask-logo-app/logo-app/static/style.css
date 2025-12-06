@@ -1,79 +1,209 @@
-@font-face {
-  font-family: "ColfaxAI";
-  src: url(https://cdn.openai.com/API/fonts/ColfaxAIRegular.woff2)
-      format("woff2"),
-    url(https://cdn.openai.com/API/fonts/ColfaxAIRegular.woff) format("woff");
-  font-weight: normal;
-  font-style: normal;
+:root {
+    --primary: #2563eb;
+    --bg: #f8fafc;
+    --card-bg: #ffffff;
+    --text: #1e293b;
+    --border: #e2e8f0;
 }
-@font-face {
-  font-family: "ColfaxAI";
-  src: url(https://cdn.openai.com/API/fonts/ColfaxAIBold.woff2) format("woff2"),
-    url(https://cdn.openai.com/API/fonts/ColfaxAIBold.woff) format("woff");
-  font-weight: bold;
-  font-style: normal;
-}
-body,
-input {
-  font-size: 16px;
-  line-height: 24px;
-  color: #353740;
-  font-family: "ColfaxAI", Helvetica, sans-serif;
-}
+
 body {
-  display: flex;
-  flex-direction: column;
-  align-items: center;
-  padding-top: 60px;
+    font-family: 'Segoe UI', sans-serif;
+    background-color: var(--bg);
+    color: var(--text);
+    margin: 0;
+    display: flex;
+    justify-content: center;
+    padding-bottom: 50px;
 }
-.icon {
-  width: 34px;
+
+.main-container {
+    width: 100%;
+    max-width: 800px;
+    padding: 20px;
 }
-h3 {
-  font-size: 32px;
-  line-height: 40px;
-  font-weight: bold;
-  color: #202123;
-  margin: 16px 0 40px;
+
+/* Header */
+.header {
+    text-align: center;
+    margin: 40px 0;
 }
+.logo-mark {
+    background: var(--primary);
+    color: white;
+    width: 50px;
+    height: 50px;
+    border-radius: 12px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-weight: bold;
+    margin: 0 auto 15px;
+    font-size: 20px;
+}
+
+/* Form */
 form {
-  display: flex;
-  flex-direction: column;
-  width: 320px;
+    background: var(--card-bg);
+    padding: 30px;
+    border-radius: 16px;
+    box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.1);
+    display: flex;
+    flex-direction: column;
+    gap: 20px;
 }
-input[type="text"] {
-  padding: 12px 16px;
-  border: 1px solid #f21b3f;
-  border-radius: 4px;
-  margin-bottom: 24px;
+
+.form-row {
+    display: flex;
+    gap: 20px;
 }
-::placeholder {
-  color: #8e8ea0;
-  opacity: 1;
+
+.form-group {
+    flex: 1;
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
 }
-input[type="submit"] {
-  padding: 12px 0;
-  color: #fff;
-  background-color: #f21b3f;
-  border: none;
-  border-radius: 4px;
-  text-align: center;
-  cursor: pointer;
+
+label {
+    font-size: 14px;
+    font-weight: 600;
+    color: #64748b;
 }
-input[type="submit"]:hover {
-  background-color: #c21632;
+
+input, select {
+    padding: 12px;
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    font-size: 16px;
 }
-.result {
-  font-weight: bold;
-  margin-top: 40px;
-  white-space: pre-wrap;
-  white-space: -moz-pre-wrap;
-  white-space: -o-pre-wrap;
-  word-wrap: break-word;
-  display:flex;
-  gap: 10px;
+
+button {
+    background: var(--primary);
+    color: white;
+    padding: 14px;
+    border: none;
+    border-radius: 8px;
+    font-size: 16px;
+    font-weight: 600;
+    cursor: pointer;
+    transition: 0.2s;
 }
+
+button:hover { opacity: 0.9; }
+button:disabled { background: #cbd5e1; }
+
+/* Results */
+.logos-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(250px, 1fr));
+    gap: 20px;
+    margin-top: 20px;
+}
+
+.logo-card {
+    background: white;
+    padding: 10px;
+    border-radius: 12px;
+    box-shadow: 0 2px 4px rgba(0,0,0,0.05);
+    text-align: center;
+}
+
+.logo-card img {
+    width: 100%;
+    border-radius: 8px;
+}
+
+.download-btn {
+    display: block;
+    margin-top: 10px;
+    text-decoration: none;
+    color: var(--primary);
+    font-size: 14px;
+    font-weight: 600;
+}
+
+/* Mockup Section (Eye Catching!) */
+.mockup-container {
+    display: flex;
+    gap: 30px;
+    justify-content: center;
+    flex-wrap: wrap;
+    margin-top: 20px;
+}
+
+.mockup-card.business-card {
+    width: 300px;
+    height: 180px;
+    background: white;
+    border-radius: 10px;
+    box-shadow: 0 10px 25px rgba(0,0,0,0.15);
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 20px;
+    position: relative;
+    overflow: hidden;
+}
+
+.business-card::before {
+    content: '';
+    position: absolute;
+    top: 0; right: 0;
+    width: 100px; height: 100%;
+    background: #f1f5f9;
+    transform: skewX(-15deg) translateX(50px);
+    z-index: 0;
+}
+
+.mockup-logo {
+    width: 80px;
+    height: 80px;
+    border-radius: 50%;
+    object-fit: cover;
+    z-index: 1;
+}
+
+.card-text {
+    z-index: 1;
+    text-align: right;
+}
+
+.mockup-card.app-icon {
+    width: 100px;
+    height: 100px;
+    border-radius: 22px;
+    box-shadow: 0 10px 20px rgba(0,0,0,0.2);
+    overflow: hidden;
+}
+
+.mockup-logo-icon {
+    width: 100%;
+    height: 100%;
+    object-fit: cover;
+}
+
+/* Loading */
 .loading {
-  margin-top: 12px;
-  display: none;
+    display: none;
+    flex-direction: column;
+    align-items: center;
+    margin-top: 40px;
+}
+.spinner {
+    width: 40px; height: 40px;
+    border: 4px solid #f3f3f3;
+    border-top: 4px solid var(--primary);
+    border-radius: 50%;
+    animation: spin 1s linear infinite;
+}
+@keyframes spin { 100% { transform: rotate(360deg); } }
+
+/* Error */
+.error-card {
+    background: #fee2e2;
+    color: #991b1b;
+    padding: 16px;
+    border-radius: 8px;
+    margin-top: 20px;
+    font-weight: 500;
 }

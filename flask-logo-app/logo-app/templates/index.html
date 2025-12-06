@@ -1,36 +1,105 @@
 <!DOCTYPE html>
+<html lang="en">
 <head>
-  <title>OpenAI Logo Maker</title>
-  <link
-    rel="shortcut icon"
-    href="{{ url_for('static', filename='icon.jpg') }}"
-  />
-  <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}" />
-  <script src="https://code.jquery.com/jquery-3.7.0.min.js"></script>
-  <script type="text/javascript">
-    function loading(){
-      $(".loading").show();
-    }
-  </script>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>GenAI Brand Designer</title>
+    <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
 </head>
-
 <body>
-  <img src="{{ url_for('static', filename='icon.jpg') }}" class="icon" />
-  <h3>Generate a Lettermark logo</h3>
-  <form action="/" method="post">
-    <input type="text" name="color" placeholder="Enter the logo color, e.g. dark gold" required />
-    <input type="text" name="text" placeholder="Enter the brand name, e.g. Fast Delivery" required />
-    <input type="text" name="number" placeholder="How many proposals, e.g. 1,2,...,5" required />
-    <input type="submit" value="GENERATE LOGO" onclick="loading();" />
-  </form>
-  {% if result %}
-  <div class="result">
-    {%for i in result['data']%}
-      <img src={{i['url']}}>
-    {%endfor%}
-  </div>
-  {% endif %}
-  <div class="loading">
-    <img src="{{ url_for('static', filename='loading.jpg') }}" width="35" height="35">
-  </div>
+
+<div class="main-container">
+    <!-- Header -->
+    <div class="header">
+        <div class="logo-mark">AI</div>
+        <h1>Brand Logo Generator</h1>
+        <p>Create a professional identity in seconds.</p>
+    </div>
+
+    <!-- Input Form -->
+    <form action="/" method="post" onsubmit="startLoading()">
+        <div class="form-group">
+            <label>Brand Name</label>
+            <input type="text" name="text" placeholder="e.g. Velocity Tech" required>
+        </div>
+        
+        <div class="form-row">
+            <div class="form-group">
+                <label>Color Theme</label>
+                <input type="text" name="color" placeholder="e.g. Electric Blue" required>
+            </div>
+            <div class="form-group">
+                <label>Style Aesthetic</label>
+                <select name="style">
+                    <option value="Minimalist, modern, clean lines">Minimalist</option>
+                    <option value="Cyberpunk, neon, futuristic">Futuristic / Tech</option>
+                    <option value="Vintage, badge, hand-drawn">Vintage / Retro</option>
+                    <option value="Luxury, serif font, gold texture">Luxury / Elegant</option>
+                    <option value="Playful, 3D character, bubble">Playful / Mascot</option>
+                </select>
+            </div>
+        </div>
+
+        <button type="submit" id="generateBtn">Generate Identity ➜</button>
+    </form>
+
+    <!-- Loading State -->
+    <div class="loading" id="loading">
+        <div class="spinner"></div>
+        <p>Drafting concepts...</p>
+    </div>
+
+    <!-- Error Message -->
+    {% if error %}
+    <div class="error-card">
+        ⚠️ {{ error }}
+    </div>
+    {% endif %}
+
+    <!-- Results Area -->
+    {% if result %}
+    <div class="results-section">
+        <h2>Your Brand Concepts</h2>
+        
+        <div class="logos-grid">
+            {% for url in result %}
+            <div class="logo-card">
+                <div class="img-wrapper">
+                    <img src="{{ url }}" alt="Generated Logo">
+                </div>
+                <a href="{{ url }}" target="_blank" class="download-btn">Download HD</a>
+            </div>
+            {% endfor %}
+        </div>
+
+        <!-- MOCKUP PREVIEW FEATURE -->
+        <h2 style="margin-top: 40px;">Real-World Mockups</h2>
+        <div class="mockup-container">
+            <!-- Business Card Mockup -->
+            <div class="mockup-card business-card">
+                <img src="{{ result[0] }}" class="mockup-logo">
+                <div class="card-text">
+                    <h3>{{ brand }}</h3>
+                    <p>Founder & CEO</p>
+                </div>
+            </div>
+            
+            <!-- App Icon Mockup -->
+            <div class="mockup-card app-icon">
+                <img src="{{ result[0] }}" class="mockup-logo-icon">
+            </div>
+        </div>
+    </div>
+    {% endif %}
+</div>
+
+<script>
+    function startLoading() {
+        document.getElementById('loading').style.display = 'flex';
+        document.getElementById('generateBtn').disabled = true;
+        document.getElementById('generateBtn').innerText = 'Designing...';
+    }
+</script>
+
 </body>
+</html>
