@@ -35,6 +35,8 @@ An advanced Flask application that leverages OpenAI's DALL-E to generate deeply 
 3.  **Setup Environment:**
     Create a `.env` file in the root folder:
     ```
+    FLASK_APP=openai-logo-app/app.py
+    FLASK_DEBUG=1
     OPENAI_API_KEY=sk-your-key-here
     ```
 
