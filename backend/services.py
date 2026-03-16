@@ -1,229 +1,321 @@
+"""
+services.py – Logo generation services.
+
+Fixes in this version
+─────────────────────
+1. PROMPT: Explicit "logo mark ONLY" constraints at the TOP of every prompt
+   stop DALL-E from generating business-card scenes / mockups. A hard
+   negative list ("NO mockups, NO 3D renders, NO staging…") is prepended.
+
+2. UNIQUE FILENAMES: Every generated file gets a timestamp+variation suffix
+   so repeated calls never serve a cached file from disk.
+   Gemini: generated_logos/gemini/<brand>_<ts>_v<n>.png
+   DALL-E: generated_logos/dalle/<brand>_<ts>_v<n>.png
+
+3. DALL-E LOCAL SAVE: After getting the temporary OpenAI URL, the image is
+   downloaded and stored locally (generated_logos/dalle/). The local path
+   is returned instead of the expiring URL, making downloads reliable.
+
+4. STYLE / PALETTE PROMINENCE: Style and color palette appear at the very
+   start of the prompt (after the hard constraints), not buried at the end,
+   so Gemini/DALL-E give them proper weight.
+
+5. asyncio timeouts and response_modalities=["IMAGE"] retained from
+   previous version.
+"""
+
 import io
 import asyncio
-from typing import Optional, Tuple
+import time
+from pathlib import Path
+from typing import Tuple
+
+import requests as _requests      # synchronous – used in to_thread for DALL-E download
 from PIL import Image
 from google import genai
+from google.genai import types
 from openai import AsyncOpenAI
-from config import DALLE3_PROMPT_TEMPLATE, GEMINI_GENERATION_TEMPLATE
-from utils import get_output_path, sanitize_filename
+
+from utils import get_output_path, ensure_output_directory, sanitize_filename
 
 
-class PromptRefinementService:
-    """Service for refining prompts using OpenAI GPT-4"""
+# ─────────────────────────────────────────────────────────────────────────────
+# Output sub-directories
+# ─────────────────────────────────────────────────────────────────────────────
 
-    def __init__(self, client: AsyncOpenAI):
-        self.client = client
+def _gemini_output_dir() -> str:
+    return ensure_output_directory("generated_logos/gemini")
 
-    async def refine_for_dalle(self, 
-                               text: str, 
-                               description: str, 
-                               style: str, 
-                               palette: str,
-                               tagline: str = "",
-                               typography: str = "",
-                               elements_to_include: str = "",
-                               elements_to_avoid: str = "",
-                               brand_mission: str = "") -> str:
-        """
-        Use OpenAI GPT-4 Turbo to refine a prompt for DALL-E 3.
-        Provides better quality prompts than template-based approaches.
-        """
-        
-        detailed_prompt = (
-            f"Professional logo design prompt engineering:\n"
-            f"Brand Name: {text}\n"
-            f"Description: {description}\n"
-            f"Style: {style}\n"
-            f"Color Palette: {palette}\n"
-            f"{f'Tagline: {tagline}' if tagline else ''}\n"
-            f"{f'Typography Preference: {typography}' if typography else ''}\n"
-            f"{f'Brand Mission: {brand_mission}' if brand_mission else ''}\n"
-            f"{f'Elements to Include: {elements_to_include}' if elements_to_include else ''}\n"
-            f"{f'Elements to Avoid: {elements_to_avoid}' if elements_to_avoid else ''}\n\n"
-            
-            f"Create a detailed, high-quality DALL-E 3 prompt for a professional logo that:\n"
-            f"- Captures the brand essence\n"
-            f"- Uses the specified color palette\n"
-            f"- Matches the visual style\n"
-            f"- Is vector-ready and scalable\n"
-            f"- Has a clean white background\n"
-            f"- Is suitable for modern web and mobile applications\n\n"
-            f"Return ONLY the optimized prompt text, nothing else."
+def _dalle_output_dir() -> str:
+    return ensure_output_directory("generated_logos/dalle")
+
+
+def _unique_filename(brand: str, generator: str, variation_index: int) -> str:
+    """
+    Produce a filename that is unique per call so disk never caches a stale image.
+    Format: <brand>_<unix_ts>_v<variation>.png
+    """
+    ts    = int(time.time())
+    safe  = sanitize_filename(brand.replace(" ", "_") or "logo")
+    return f"{generator}_{safe}_{ts}_v{variation_index}.png"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Prompt builder
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Hard constraints injected at the START of every prompt.
+# They appear before any brand/style instructions so DALL-E and Gemini
+# don't drift into "scene" or "mockup" mode.
+_LOGO_HARD_CONSTRAINTS = (
+    "OUTPUT REQUIREMENT: A single, isolated, flat 2D logo mark on a pure white background. "
+    "STRICTLY NO: 3D renders, drop-shadows, gradients unless part of the palette, "
+    "business-card mockups, product staging, photo-realistic scenes, textures, "
+    "hands, people, environments, or any context other than the logo itself. "
+    "The entire image must show ONLY the logo symbol / wordmark centred on white. "
+)
+
+
+def build_logo_prompt(
+    text: str,
+    description: str,
+    style: str,
+    palette: str,
+    tagline: str = "",
+    typography: str = "",
+    elements_to_include: str = "",
+    elements_to_avoid: str = "",
+    brand_mission: str = "",
+    variation_hint: str = "",
+    variation_index: int = 0,
+) -> str:
+    """
+    Build a rich logo-specific prompt.
+    Hard output constraints come FIRST so they are not overridden by
+    later creative instructions.
+    Style and palette come SECOND so the model weights them heavily.
+    """
+    parts = [_LOGO_HARD_CONSTRAINTS]
+
+    # Style and palette upfront — most important creative parameters
+    parts.append(
+        f"DESIGN STYLE: {style}. "
+        f"COLOR PALETTE: Use ONLY these colors — {palette}. "
+        "Do not introduce colors outside this palette."
+    )
+
+    parts.append(f"Brand name: '{text}'.")
+
+    if description:
+        parts.append(f"Brand context: {description}.")
+    if tagline:
+        parts.append(f"Brand tagline: '{tagline}'.")
+    if brand_mission:
+        parts.append(f"Brand mission: {brand_mission}.")
+    if typography:
+        parts.append(f"Typography style: {typography}.")
+    if elements_to_include:
+        parts.append(f"Incorporate these visual elements: {elements_to_include}.")
+    if elements_to_avoid:
+        parts.append(f"Do NOT include: {elements_to_avoid}.")
+
+    # Variation steering — ensures each regeneration is visually distinct
+    if variation_hint:
+        parts.append(
+            f"VARIATION DIRECTION (important — this call must look clearly different "
+            f"from any previous version): {variation_hint}."
+        )
+    elif variation_index > 0:
+        # Even without an explicit hint, tell the model it's a new variant
+        parts.append(
+            f"This is variation #{variation_index}. "
+            "Explore a completely different composition, icon concept, and layout "
+            "compared to the default version."
         )
 
-        response = await self.client.chat.completions.create(
-            model="gpt-4-turbo",  # Using latest GPT-4 Turbo model
-            messages=[
-                {
-                    "role": "system",
-                    "content": "You are an expert logo designer and AI prompt engineer. Create detailed, high-quality prompts for DALL-E 3 image generation."
-                },
-                {
-                    "role": "user",
-                    "content": detailed_prompt
-                }
-            ],
-            temperature=0.7,
-            max_tokens=500
-        )
-        
-        return response.choices[0].message.content.strip()
+    parts += [
+        "Keep the composition centered and balanced.",
+        "Vector-quality edges, professional finish, scalable to any size.",
+        f"Brand name '{text}' may appear as a wordmark only if it integrates naturally.",
+    ]
+
+    return " ".join(parts)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Gemini service
+# ─────────────────────────────────────────────────────────────────────────────
+
+_GEMINI_MODEL_TIMEOUT = 45
+
+_GEMINI_IMAGE_MODELS = [
+   "gemini-3.1-flash-image-preview",  # Latest and best for logos if available
+]
 
 
 class GeminiService:
-    """Service for Gemini API operations"""
-
     def __init__(self, client: genai.Client):
         self.client = client
 
-    async def generate_logo(self, 
-                           text: str, 
-                           description: str, 
-                           style: str, 
-                           palette: str,
-                           tagline: str = "",
-                           typography: str = "",
-                           elements_to_include: str = "",
-                           elements_to_avoid: str = "",
-                           brand_mission: str = "") -> Tuple[str, str]:
-        """
-        Generate a logo using Gemini's image generation capabilities.
-        Gemini-only path: no external refinement services used.
-        
-        Returns:
-            Tuple of (image_path, prompt_used)
-        """
-        
-        # Build comprehensive prompt using all available parameters
-        prompt = (
-            f"Create a professional, high-quality logo for a brand named '{text}'.\n\n"
-            f"Brand Details:\n"
-            f"- Description: {description}\n"
-            f"{f'- Tagline: {tagline}' if tagline else ''}\n"
-            f"{f'- Mission: {brand_mission}' if brand_mission else ''}\n\n"
-            f"Design Specifications:\n"
-            f"- Visual Style: {style}\n"
-            f"- Color Palette: {palette}\n"
-            f"{f'- Typography: {typography}' if typography else ''}\n"
-            f"{f'- Must Include: {elements_to_include}' if elements_to_include else ''}\n"
-            f"{f'- Must Avoid: {elements_to_avoid}' if elements_to_avoid else ''}\n\n"
-            f"Requirements:\n"
-            f"- Professional, high-resolution quality\n"
-            f"- Vector-style, scalable design\n"
-            f"- Clean white or transparent background\n"
-            f"- Suitable for professional use on web and mobile\n"
-            f"- Modern and timeless design"
-        )
-
-        response = await asyncio.to_thread(
-            self.client.models.generate_content,
-            model='gemini-2.0-flash-001',  # Latest stable Gemini model for images
+    def _call_model(self, model: str, prompt: str):
+        return self.client.models.generate_content(
+            model=model,
             contents=[prompt],
+            config=types.GenerateContentConfig(
+                response_modalities=["IMAGE"],
+            ),
         )
 
-        image_path = None
-        # Process response and extract image
-        for part in response.candidates[0].content.parts:
-            if part.inline_data:
-                # Save image from inline data
-                image = Image.open(io.BytesIO(part.inline_data.data))
-                sanitized_name = sanitize_filename(f"gemini_logo_{text.replace(' ', '_')}.png")
-                image_path = get_output_path(sanitized_name)
-                image.save(image_path)
-                break
+    async def _try_model(self, model: str, prompt: str):
+        try:
+            return await asyncio.wait_for(
+                asyncio.to_thread(self._call_model, model, prompt),
+                timeout=_GEMINI_MODEL_TIMEOUT,
+            )
+        except asyncio.TimeoutError:
+            print(f"[Gemini] '{model}' timed out after {_GEMINI_MODEL_TIMEOUT} s")
+            return None
+        except Exception as exc:
+            print(f"[Gemini] '{model}' failed: {exc}")
+            return None
 
-        if not image_path:
-            raise ValueError("No image generated by Gemini")
+    async def generate_logo(
+        self,
+        text: str,
+        description: str,
+        style: str,
+        palette: str,
+        tagline: str = "",
+        typography: str = "",
+        elements_to_include: str = "",
+        elements_to_avoid: str = "",
+        brand_mission: str = "",
+        variation_hint: str = "",
+        variation_index: int = 0,
+    ) -> Tuple[str, str]:
+        prompt = build_logo_prompt(
+            text, description, style, palette,
+            tagline, typography,
+            elements_to_include, elements_to_avoid,
+            brand_mission, variation_hint, variation_index,
+        )
 
-        return image_path, prompt
+        for model in _GEMINI_IMAGE_MODELS:
+            print(f"[Gemini] Trying {model}  variation={variation_index} …")
+            response = await self._try_model(model, prompt)
+            if response is None:
+                continue
+
+            try:
+                response_parts = response.candidates[0].content.parts
+            except (IndexError, AttributeError) as exc:
+                print(f"[Gemini] '{model}': could not read parts — {exc}")
+                continue
+
+            for part in response_parts:
+                inline = getattr(part, "inline_data", None)
+                if inline and getattr(inline, "data", None):
+                    img    = Image.open(io.BytesIO(inline.data))
+                    fname  = _unique_filename(text, "gemini", variation_index)
+                    outdir = _gemini_output_dir()
+                    path   = str(Path(outdir) / fname)
+                    img.save(path)
+                    print(f"[Gemini] ✓ saved → {path}")
+                    # Return path relative to generated_logos root for static serving
+                    rel = f"generated_logos/gemini/{fname}"
+                    return rel, prompt
+
+            print(f"[Gemini] '{model}': response had no inline image data")
+
+        raise ValueError(
+            "Gemini image generation failed — all model attempts exhausted. "
+            "Verify GEMINI_API_KEY has access to image generation models."
+        )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# DALL-E service  (saves image locally so the URL never expires)
+# ─────────────────────────────────────────────────────────────────────────────
+
+_DALLE_TIMEOUT     = 50   # seconds for the OpenAI images.generate call
+_DALLE_DL_TIMEOUT  = 20   # seconds to download the returned URL
+
+
+def _download_image(url: str, dest_path: str) -> None:
+    """Download a URL to disk synchronously (called via to_thread)."""
+    resp = _requests.get(url, timeout=_DALLE_DL_TIMEOUT)
+    resp.raise_for_status()
+    img = Image.open(io.BytesIO(resp.content))
+    img.save(dest_path)
 
 
 class DALLEService:
-    """Service for OpenAI DALL-E 3 operations"""
-
     def __init__(self, client: AsyncOpenAI):
         self.client = client
 
-    async def generate_logo(self, prompt: str) -> str:
+    async def generate_logo(
+        self, prompt: str, brand: str = "logo", variation_index: int = 0
+    ) -> str:
         """
-        Generate a logo using DALL-E 3.
-        
-        Args:
-            prompt: The prompt to use for image generation
-            
-        Returns:
-            Image URL
+        Generate with DALL-E 3, download the result, save locally.
+        Returns the relative path (e.g. generated_logos/dalle/dalle_Brand_<ts>_v0.png)
+        so it can be served via FastAPI's /static/ mount — no expiring URLs.
         """
-        response = await self.client.images.generate(
-            model="dall-e-3",
-            prompt=prompt,
-            n=1,
-            size="1024x1024",
-            quality="hd",  # Use high definition for professional logos
-            style="natural"
-        )
+        try:
+            response = await asyncio.wait_for(
+                self.client.images.generate(
+                    model="dall-e-3",
+                    prompt=prompt,
+                    n=1,
+                    size="1024x1024",
+                    quality="hd",
+                    style="natural",
+                ),
+                timeout=_DALLE_TIMEOUT,
+            )
+        except asyncio.TimeoutError:
+            raise RuntimeError(
+                f"DALL-E 3 did not respond within {_DALLE_TIMEOUT} s. "
+                "Try again or switch to Gemini."
+            )
 
-        return response.data[0].url
+        image_url = response.data[0].url
 
+        # Download and persist locally
+        fname  = _unique_filename(brand, "dalle", variation_index)
+        outdir = _dalle_output_dir()
+        path   = str(Path(outdir) / fname)
+
+        try:
+            await asyncio.wait_for(
+                asyncio.to_thread(_download_image, image_url, path),
+                timeout=_DALLE_DL_TIMEOUT + 5,
+            )
+            print(f"[DALL-E] ✓ saved → {path}")
+            rel = f"generated_logos/dalle/{fname}"
+            return rel
+        except Exception as exc:
+            # If download fails, fall back to the (temporary) URL so the user
+            # still sees something — warn in logs
+            print(f"[DALL-E] ⚠ local save failed ({exc}); returning raw URL")
+            return image_url
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Unified LLMService facade
+# ─────────────────────────────────────────────────────────────────────────────
 
 class LLMService:
-    """Unified service for LLM operations - acts as a facade"""
-
     def __init__(self, gemini_client: genai.Client, openai_client: AsyncOpenAI):
-        self.gemini_service = GeminiService(gemini_client)
-        self.dalle_service = DALLEService(openai_client)
-        self.prompt_refiner = PromptRefinementService(openai_client)
+        self.gemini = GeminiService(gemini_client)
+        self.dalle  = DALLEService(openai_client)
 
-    async def generate_logo_with_dalle(self, 
-                                       text: str, 
-                                       description: str, 
-                                       style: str, 
-                                       palette: str,
-                                       tagline: str = "",
-                                       typography: str = "",
-                                       elements_to_include: str = "",
-                                       elements_to_avoid: str = "",
-                                       brand_mission: str = "") -> Tuple[str, str]:
-        """
-        Generate logo using DALL-E 3 with GPT-4 prompt refinement.
-        DALL-E path: Uses only OpenAI services (GPT-4 for refinement + DALL-E 3 for generation)
-        
-        Returns:
-            Tuple of (image_url, optimized_prompt)
-        """
-        # Step 1: Use OpenAI GPT-4 Turbo to refine the prompt
-        optimized_prompt = await self.prompt_refiner.refine_for_dalle(
-            text, description, style, palette,
-            tagline, typography, 
-            elements_to_include, elements_to_avoid, brand_mission
-        )
+    async def generate_logo_with_dalle(self, **kwargs) -> Tuple[str, str]:
+        variation_index = kwargs.pop("variation_index", 0)
+        text            = kwargs.get("text", "logo")
+        prompt          = build_logo_prompt(**kwargs, variation_index=variation_index)
+        local_path      = await self.dalle.generate_logo(prompt, brand=text, variation_index=variation_index)
+        return local_path, prompt
 
-        # Step 2: Use DALL-E 3 for image generation
-        image_url = await self.dalle_service.generate_logo(optimized_prompt)
-
-        return image_url, optimized_prompt
-
-    async def generate_logo_with_gemini(self, 
-                                        text: str, 
-                                        description: str, 
-                                        style: str, 
-                                        palette: str,
-                                        tagline: str = "",
-                                        typography: str = "",
-                                        elements_to_include: str = "",
-                                        elements_to_avoid: str = "",
-                                        brand_mission: str = "") -> Tuple[str, str]:
-        """
-        Generate logo directly using Gemini's image generation.
-        Gemini path: Uses only Gemini services (no external LLM calls)
-        
-        Returns:
-            Tuple of (image_path, prompt_used)
-        """
-        image_path, prompt = await self.gemini_service.generate_logo(
-            text, description, style, palette,
-            tagline, typography,
-            elements_to_include, elements_to_avoid, brand_mission
-        )
-
-        return image_path, prompt
+    async def generate_logo_with_gemini(self, **kwargs) -> Tuple[str, str]:
+        return await self.gemini.generate_logo(**kwargs)

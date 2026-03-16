@@ -1,3 +1,11 @@
+"""
+routers.py – API endpoints.
+
+variation_index is now forwarded to services so filenames are unique per call
+and the prompt builder can steer visually distinct compositions.
+"""
+
+import asyncio
 from fastapi import APIRouter, HTTPException, Depends
 from google import genai
 from openai import AsyncOpenAI
@@ -9,10 +17,11 @@ from config import LOGO_STYLES, COLOR_PALETTES, SUPPORTED_GENERATORS
 
 router = APIRouter(prefix="/api", tags=["logo"])
 
+_ROUTE_TIMEOUT = 90   # hard ceiling for the entire /generate request (s)
+
 
 @router.get("/health", response_model=HealthResponse)
 async def health_check():
-    """Health check endpoint"""
     return {
         "status": "ok",
         "gemini_ready": Clients.is_gemini_ready(),
@@ -24,112 +33,69 @@ async def health_check():
 async def generate_logo(
     request: LogoGenerationRequest,
     gemini_client: genai.Client = Depends(get_gemini_client),
-    openai_client: AsyncOpenAI = Depends(get_openai_client)
+    openai_client: AsyncOpenAI  = Depends(get_openai_client),
 ):
-    """
-    Generate a logo using the specified generator with advanced branding options.
-    
-    **Generator Modes:**
-    - **dalle-3**: Uses OpenAI GPT-4 Turbo for prompt refinement + DALL-E 3 for generation
-    - **gemini**: Uses Gemini 2.0 Flash for both refinement and image generation
-    
-    **Parameters:**
-    - **text**: Brand name (required)
-    - **description**: Brand description (optional)
-    - **style**: Logo style (minimalist, tech, vintage, abstract, mascot, luxury)
-    - **palette**: Color palette (monochrome, ocean, sunset, forest, royal, neon)
-    - **generator**: Image generator (dalle-3 or gemini)
-    - **tagline**: Brand tagline/slogan (optional, advanced)
-    - **typography**: Typography preference (optional, advanced)
-    - **elements_to_include**: Specific elements to include (optional, advanced)
-    - **elements_to_avoid**: Specific elements to avoid (optional, advanced)
-    - **brand_mission**: Core purpose of the brand (optional, advanced)
-    """
-    
-    # Validate required clients based on generator choice
+    # ── Validate ──────────────────────────────────────────────────────────
     if request.generator == "dalle-3":
         if not openai_client:
-            raise HTTPException(status_code=500, detail="OpenAI API Client not initialized.")
+            raise HTTPException(500, "OpenAI API client not initialised.")
     elif request.generator == "gemini":
         if not gemini_client:
-            raise HTTPException(status_code=500, detail="Gemini API Client not initialized.")
+            raise HTTPException(500, "Gemini API client not initialised.")
     else:
         raise HTTPException(
-            status_code=400, 
-            detail=f"Invalid generator. Choose from: {', '.join(SUPPORTED_GENERATORS)}"
+            400,
+            f"Invalid generator. Choose from: {', '.join(SUPPORTED_GENERATORS)}",
         )
 
-    # Validate style
     if request.style not in LOGO_STYLES:
-        raise HTTPException(
-            status_code=400, 
-            detail=f"Invalid style. Choose from: {', '.join(LOGO_STYLES.keys())}"
-        )
-
-    # Validate palette
+        raise HTTPException(400, f"Invalid style. Choose from: {', '.join(LOGO_STYLES.keys())}")
     if request.palette not in COLOR_PALETTES:
-        raise HTTPException(
-            status_code=400, 
-            detail=f"Invalid palette. Choose from: {', '.join(COLOR_PALETTES.keys())}"
-        )
-
-    # At least brand name or description is required
+        raise HTTPException(400, f"Invalid palette. Choose from: {', '.join(COLOR_PALETTES.keys())}")
     if not request.text and not request.description:
-        raise HTTPException(
-            status_code=400,
-            detail="Please provide at least a brand name or description."
-        )
+        raise HTTPException(400, "Provide at least a brand name or description.")
+
+    # Extract variation_index (0 = first generation, >0 = regeneration)
+    variation_index = getattr(request, "variation_index", 0) or 0
+
+    common = dict(
+        text=request.text,
+        description=request.description or "",
+        style=LOGO_STYLES.get(request.style, LOGO_STYLES["minimalist"]),
+        palette=COLOR_PALETTES.get(request.palette, COLOR_PALETTES["monochrome"]),
+        tagline=request.tagline or "",
+        typography=request.typography or "",
+        elements_to_include=request.elements_to_include or "",
+        elements_to_avoid=request.elements_to_avoid or "",
+        brand_mission=request.brand_mission or "",
+        variation_hint=request.variation_hint or "",
+        variation_index=variation_index,
+    )
+
+    llm = LLMService(gemini_client, openai_client)
+
+    async def _run():
+        if request.generator == "dalle-3":
+            path, prompt = await llm.generate_logo_with_dalle(**common)
+            return {"result": [path], "generator": "dalle-3", "prompt": prompt}
+        else:
+            path, prompt = await llm.generate_logo_with_gemini(**common)
+            return {"result": [path], "generator": "gemini", "prompt": prompt}
 
     try:
-        llm_service = LLMService(gemini_client, openai_client)
+        result = await asyncio.wait_for(_run(), timeout=_ROUTE_TIMEOUT)
+    except asyncio.TimeoutError:
+        raise HTTPException(
+            504,
+            f"Generation timed out after {_ROUTE_TIMEOUT} s. "
+            "The AI model may be overloaded — please retry.",
+        )
+    except Exception as exc:
+        raise HTTPException(500, f"Generation failed: {exc}")
 
-        style_prompt = LOGO_STYLES.get(request.style, LOGO_STYLES['minimalist'])
-        palette_desc = COLOR_PALETTES.get(request.palette, COLOR_PALETTES['monochrome'])
-
-        # Route to appropriate generator
-        if request.generator == "dalle-3":
-            # DALL-E 3 path: GPT-4 refinement + DALL-E 3 generation
-            image_url, optimized_prompt = await llm_service.generate_logo_with_dalle(
-                text=request.text,
-                description=request.description or "",
-                style=style_prompt,
-                palette=palette_desc,
-                tagline=request.tagline or "",
-                typography=request.typography or "",
-                elements_to_include=request.elements_to_include or "",
-                elements_to_avoid=request.elements_to_avoid or "",
-                brand_mission=request.brand_mission or ""
-            )
-            return {
-                "result": [image_url],
-                "brand": request.text,
-                "style": request.style,
-                "palette": request.palette,
-                "prompt": optimized_prompt,
-                "generator": "dalle-3"
-            }
-        
-        else:  # gemini
-            # Gemini path: Gemini-only (no external refinement)
-            image_path, prompt = await llm_service.generate_logo_with_gemini(
-                text=request.text,
-                description=request.description or "",
-                style=style_prompt,
-                palette=palette_desc,
-                tagline=request.tagline or "",
-                typography=request.typography or "",
-                elements_to_include=request.elements_to_include or "",
-                elements_to_avoid=request.elements_to_avoid or "",
-                brand_mission=request.brand_mission or ""
-            )
-            return {
-                "result": [image_path],
-                "brand": request.text,
-                "style": request.style,
-                "palette": request.palette,
-                "prompt": prompt,
-                "generator": "gemini"
-            }
-
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Generation failed: {str(e)}")
+    return {
+        **result,
+        "brand":   request.text,
+        "style":   request.style,
+        "palette": request.palette,
+    }

@@ -5,7 +5,7 @@ from typing import Optional, List
 class LogoGenerationRequest(BaseModel):
     """Request model for logo generation with advanced options"""
     # Core fields
-    text: str = Field(..., min_length=1, description="Brand name")
+    text: str = Field(..., min_length=1, description="Brand name")  
     description: Optional[str] = Field("", description="Brand description")
     style: str = Field("minimalist", description="Logo style")
     palette: str = Field("monochrome", description="Color palette")
@@ -18,6 +18,17 @@ class LogoGenerationRequest(BaseModel):
     elements_to_avoid: Optional[str] = Field("", description="Specific elements to avoid in logo")
     brand_mission: Optional[str] = Field("", description="Core purpose or mission of the brand")
 
+    # Variation control
+    variation_hint: Optional[str] = Field(
+        "",
+        description="Creative direction injected into the prompt on regeneration.",
+    )
+    variation_index: Optional[int] = Field(
+        0,
+        ge=0,
+        description="0 = fresh generation; >0 = Nth regeneration. "
+                    "Used for unique filenames and compositional variation.",
+    )
 
 class LogoGenerationResponse(BaseModel):
     """Response model for logo generation"""
@@ -29,10 +40,10 @@ class LogoGenerationResponse(BaseModel):
     generator: str = Field(..., description="Generator used")
 
 
-class LogoModificationRequest(BaseModel):
-    """Request model for logo modification"""
-    instructions: str = Field(..., min_length=1, description="Modification instructions")
-    generator: str = Field("dalle-3", description="Image generator: 'dalle-3' or 'gemini'")
+# class LogoModificationRequest(BaseModel):
+#     """Request model for logo modification"""
+#     instructions: str = Field(..., min_length=1, description="Modification instructions")
+#     generator: str = Field("dalle-3", description="Image generator: 'dalle-3' or 'gemini'")
 
 
 class HealthResponse(BaseModel):
