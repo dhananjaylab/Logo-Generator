@@ -44,6 +44,13 @@ streamlit run streamlit_app.py
 # Opens http://localhost:8501
 ```
 
+**Terminal 3 - Worker:**
+```bash
+cd backend
+arq worker.WorkerSettings
+# Runs on http://localhost:5050
+```
+
 ### 4. Generate
 - Open http://localhost:8501
 - Enter brand name
