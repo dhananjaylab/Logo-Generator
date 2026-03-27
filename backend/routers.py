@@ -6,12 +6,15 @@ and the prompt builder can steer visually distinct compositions.
 """
 
 import asyncio
-from fastapi import APIRouter, HTTPException, Depends
+from typing import List
+from fastapi import APIRouter, HTTPException, Depends, Request
+from sqlalchemy import select, desc
 from google import genai
 from openai import AsyncOpenAI
 
 from models import LogoGenerationRequest, LogoGenerationResponse, HealthResponse
 from services import LLMService
+from database import get_db, LogoGeneration
 from dependencies import get_gemini_client, get_openai_client, Clients
 from config import LOGO_STYLES, COLOR_PALETTES, SUPPORTED_GENERATORS
 
@@ -32,9 +35,11 @@ async def health_check():
 @router.post("/generate", response_model=LogoGenerationResponse)
 async def generate_logo(
     request: LogoGenerationRequest,
+    fastapi_request: Request,
     gemini_client: genai.Client = Depends(get_gemini_client),
     openai_client: AsyncOpenAI  = Depends(get_openai_client),
 ):
+    user_ip = fastapi_request.client.host if fastapi_request.client else None
     # ── Validate ──────────────────────────────────────────────────────────
     if request.generator == "dalle-3":
         if not openai_client:
@@ -76,10 +81,10 @@ async def generate_logo(
 
     async def _run():
         if request.generator == "dalle-3":
-            path, prompt = await llm.generate_logo_with_dalle(**common)
+            path, prompt = await llm.generate_logo_with_dalle(user_ip=user_ip, **common)
             return {"result": [path], "generator": "dalle-3", "prompt": prompt}
         else:
-            path, prompt = await llm.generate_logo_with_gemini(**common)
+            path, prompt = await llm.generate_logo_with_gemini(user_ip=user_ip, **common)
             return {"result": [path], "generator": "gemini", "prompt": prompt}
 
     try:
@@ -99,3 +104,22 @@ async def generate_logo(
         "style":   request.style,
         "palette": request.palette,
     }
+
+
+@router.get("/history")
+async def get_generation_history(
+    limit: int = 20,
+    db = Depends(get_db)
+):
+    """Retrieve the latest logo generation history."""
+    if not db:
+        return []
+        
+    try:
+        stmt = select(LogoGeneration).order_by(desc(LogoGeneration.created_at)).limit(limit)
+        result = await db.execute(stmt)
+        history = result.scalars().all()
+        return history
+    except Exception as e:
+        print(f"[DB] ⚠ Failed to fetch history: {e}")
+        return []
