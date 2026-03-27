@@ -1,26 +1,32 @@
-"""
-routers.py – API endpoints.
-
-variation_index is now forwarded to services so filenames are unique per call
-and the prompt builder can steer visually distinct compositions.
-"""
-
 import asyncio
-from typing import List
+from typing import List, Optional
 from fastapi import APIRouter, HTTPException, Depends, Request
 from sqlalchemy import select, desc
 from google import genai
 from openai import AsyncOpenAI
+from arq import create_pool
+from arq.connections import RedisSettings
 
-from models import LogoGenerationRequest, LogoGenerationResponse, HealthResponse
+from models import (
+    LogoGenerationRequest, 
+    LogoGenerationResponse, 
+    HealthResponse, 
+    LogoJobResponse, 
+    JobStatusResponse
+)
 from services import LLMService
 from database import get_db, LogoGeneration
 from dependencies import get_gemini_client, get_openai_client, Clients
-from config import LOGO_STYLES, COLOR_PALETTES, SUPPORTED_GENERATORS
+from config import LOGO_STYLES, COLOR_PALETTES, SUPPORTED_GENERATORS, REDIS_URL
 
 router = APIRouter(prefix="/api", tags=["logo"])
 
 _ROUTE_TIMEOUT = 90   # hard ceiling for the entire /generate request (s)
+
+
+async def get_redis():
+    """Dependency to get ARQ redis pool"""
+    return await create_pool(RedisSettings.from_dsn(REDIS_URL))
 
 
 @router.get("/health", response_model=HealthResponse)
@@ -32,10 +38,11 @@ async def health_check():
     }
 
 
-@router.post("/generate", response_model=LogoGenerationResponse)
+@router.post("/generate", response_model=LogoJobResponse)
 async def generate_logo(
     request: LogoGenerationRequest,
     fastapi_request: Request,
+    redis=Depends(get_redis),
     gemini_client: genai.Client = Depends(get_gemini_client),
     openai_client: AsyncOpenAI  = Depends(get_openai_client),
 ):
@@ -77,33 +84,65 @@ async def generate_logo(
         variation_index=variation_index,
     )
 
-    llm = LLMService(gemini_client, openai_client)
-
-    async def _run():
-        if request.generator == "dalle-3":
-            path, prompt = await llm.generate_logo_with_dalle(user_ip=user_ip, **common)
-            return {"result": [path], "generator": "dalle-3", "prompt": prompt}
-        else:
-            path, prompt = await llm.generate_logo_with_gemini(user_ip=user_ip, **common)
-            return {"result": [path], "generator": "gemini", "prompt": prompt}
-
-    try:
-        result = await asyncio.wait_for(_run(), timeout=_ROUTE_TIMEOUT)
-    except asyncio.TimeoutError:
-        raise HTTPException(
-            504,
-            f"Generation timed out after {_ROUTE_TIMEOUT} s. "
-            "The AI model may be overloaded — please retry.",
-        )
-    except Exception as exc:
-        raise HTTPException(500, f"Generation failed: {exc}")
+    # Enqueue the job
+    job = await redis.enqueue_job(
+        "generate_logo_task",
+        generator=request.generator,
+        user_ip=user_ip,
+        **common
+    )
 
     return {
-        **result,
-        "brand":   request.text,
-        "style":   request.style,
-        "palette": request.palette,
+        "job_id": job.job_id,
+        "status": "enqueued"
     }
+
+
+@router.get("/jobs/{job_id}", response_model=JobStatusResponse)
+async def get_job_status(job_id: str, redis=Depends(get_redis)):
+    """Check the status of a background job."""
+    from arq.jobs import Job
+    job_instance = Job(job_id, redis)
+    
+    try:
+        status = await job_instance.status()
+        result_info = await job_instance.result_info()
+        
+        if status == "complete" and result_info:
+            # Map the result back to LogoGenerationResponse
+            res_data = result_info.result
+            if res_data.get("status") == "failed":
+                return {
+                    "job_id": job_id,
+                    "status": "failed",
+                    "error": res_data.get("error")
+                }
+            
+            # Reconstruct the response
+            return {
+                "job_id": job_id,
+                "status": "completed",
+                "result": {
+                    "result": res_data.get("result"),
+                    "generator": res_data.get("generator"),
+                    "prompt": res_data.get("prompt"),
+                    "brand": result_info.kwargs.get("text"),
+                    "style": result_info.kwargs.get("style"),
+                    "palette": result_info.kwargs.get("palette"),
+                }
+            }
+        elif status == "not_found":
+            raise HTTPException(404, f"Job {job_id} not found")
+        else:
+            # Handle JobStatus enum or string
+            status_str = status.value if hasattr(status, "value") else str(status)
+            return {
+                "job_id": job_id,
+                "status": status_str
+            }
+    except Exception as e:
+        print(f"[API] Error fetching job status: {e}")
+        raise HTTPException(500, f"Error fetching job status: {e}")
 
 
 @router.get("/history")

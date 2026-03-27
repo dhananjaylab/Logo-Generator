@@ -895,18 +895,42 @@ async function generateLogo(isRegen) {
       signal:  ctrl.signal,
     });
 
-    clearTimeout(hardTimeout);
-
     if (!r.ok) {
       const d = await r.json().catch(() => ({}));
-      const msg = r.status === 504
-        ? "The AI model took too long. Please try again."
-        : (d.detail || "HTTP " + r.status);
-      throw new Error(msg);
+      throw new Error(d.detail || "HTTP " + r.status);
     }
 
-    const data   = await r.json();
-    const raw    = data.result[0];
+    const { job_id } = await r.json();
+    console.log("[JS] Enqueued job:", job_id);
+
+    // --- Polling loop ---
+    let jobData = null;
+    let attempts = 0;
+    while (attempts < 60) { // Max 60 attempts (~60-120 seconds)
+      if (ctrl.signal.aborted) throw new Error("AbortError");
+      
+      const res = await fetch(API + "/api/jobs/" + job_id, { signal: ctrl.signal });
+      if (!res.ok) throw new Error("Failed to check job status");
+      
+      const statusData = await res.json();
+      console.log("[JS] Job status:", statusData.status);
+      
+      if (statusData.status === "completed") {
+        jobData = statusData.result;
+        break;
+      } else if (statusData.status === "failed") {
+        throw new Error(statusData.error || "Generation task failed");
+      }
+      
+      attempts++;
+      await new Promise(resolve => setTimeout(resolve, 1500)); // Poll every 1.5s
+    }
+
+    if (!jobData) throw new Error("Generation timed out");
+
+    clearTimeout(hardTimeout);
+
+    const raw    = jobData.result[0];
     // Both generators return a relative path like generated_logos/dalle/... or generated_logos/gemini/...
     // Full https:// URLs (fallback) are used as-is.
     const imgSrc = raw.startsWith("http") ? raw : API + "/static/" + raw.split("\\").join("/");
@@ -920,7 +944,7 @@ async function generateLogo(isRegen) {
   } catch (e) {
     clearTimeout(hardTimeout);
     finishProgress(false);
-    if (e.name === "AbortError") {
+    if (e.name === "AbortError" || e.message === "AbortError") {
       showErr("Generation cancelled.");
     } else {
       showErr(e.message || "Unexpected error");

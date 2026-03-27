@@ -40,15 +40,23 @@ class LogoGenerationResponse(BaseModel):
     generator: str = Field(..., description="Generator used")
 
 
-# class LogoModificationRequest(BaseModel):
-#     """Request model for logo modification"""
-#     instructions: str = Field(..., min_length=1, description="Modification instructions")
-#     generator: str = Field("dalle-3", description="Image generator: 'dalle-3' or 'gemini'")
-
-
 class HealthResponse(BaseModel):
     """Health check response"""
     status: str = Field(..., description="Service status")
     gemini_ready: bool = Field(..., description="Gemini client ready")
     openai_ready: bool = Field(..., description="OpenAI client ready")
+
+
+class LogoJobResponse(BaseModel):
+    """Initial response when a job is enqueued"""
+    job_id: str = Field(..., description="The unique ID of the background job")
+    status: str = Field("enqueued", description="Initial status of the job")
+
+
+class JobStatusResponse(BaseModel):
+    """Response model for checking job status"""
+    job_id: str = Field(..., description="The unique ID of the job")
+    status: str = Field(..., description="Current status: 'enqueued', 'running', 'completed', 'failed'")
+    result: Optional[LogoGenerationResponse] = Field(None, description="The generation result if completed")
+    error: Optional[str] = Field(None, description="Error message if failed")
 
