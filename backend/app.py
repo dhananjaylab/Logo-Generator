@@ -8,6 +8,7 @@ from dotenv import load_dotenv
 load_dotenv()
 
 from routers import router as logo_router
+from database import init_db
 
 app = FastAPI(
     title="Logo Generator API",
@@ -26,6 +27,11 @@ app.add_middleware(
 # ── Endpoints ───────────────────────────────────────────────────────────────
 
 app.include_router(logo_router)
+
+@app.on_event("startup")
+async def startup_event():
+    """Initialize database tables on startup if DATABASE_URL is set."""
+    await init_db()
 
 
 @app.get("/")

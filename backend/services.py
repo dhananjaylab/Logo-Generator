@@ -44,8 +44,9 @@ from config import (
     R2_SECRET_ACCESS_KEY,
     R2_ENDPOINT_URL,
     R2_PUBLIC_DOMAIN,
+    DATABASE_URL,
 )
-
+from database import AsyncSessionLocal, LogoGeneration
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Cloudflare R2 / S3 Client
@@ -352,12 +353,50 @@ class LLMService:
         self.gemini = GeminiService(gemini_client)
         self.dalle  = DALLEService(openai_client)
 
-    async def generate_logo_with_dalle(self, **kwargs) -> Tuple[str, str]:
+    async def _save_to_db(
+        self, 
+        brand: str, 
+        prompt: str, 
+        generator: str, 
+        url: str, 
+        ip: str = None
+    ) -> None:
+        """Asynchronously save generation metadata to PostgreSQL."""
+        if not AsyncSessionLocal:
+            print("[DB] ⚠ DATABASE_URL not set; skipping history save")
+            return
+
+        async with AsyncSessionLocal() as session:
+            try:
+                new_entry = LogoGeneration(
+                    brand_name=brand,
+                    prompt=prompt,
+                    generator=generator,
+                    image_url=url,
+                    ip_address=ip
+                )
+                session.add(new_entry)
+                await session.commit()
+                print(f"[DB] ✓ Logged generation for '{brand}' ({generator})")
+            except Exception as e:
+                print(f"[DB] ⚠ Failed to save history: {e}")
+                await session.rollback()
+
+    async def generate_logo_with_dalle(self, user_ip: str = None, **kwargs) -> Tuple[str, str]:
         variation_index = kwargs.pop("variation_index", 0)
         text            = kwargs.get("text", "logo")
         prompt          = build_logo_prompt(**kwargs, variation_index=variation_index)
         local_path      = await self.dalle.generate_logo(prompt, brand=text, variation_index=variation_index)
+        
+        # Save to DB
+        await self._save_to_db(text, prompt, "dalle-3", local_path, user_ip)
+        
         return local_path, prompt
 
-    async def generate_logo_with_gemini(self, **kwargs) -> Tuple[str, str]:
-        return await self.gemini.generate_logo(**kwargs)
+    async def generate_logo_with_gemini(self, user_ip: str = None, **kwargs) -> Tuple[str, str]:
+        url, prompt = await self.gemini.generate_logo(**kwargs)
+        
+        # Save to DB
+        await self._save_to_db(kwargs.get("text", "logo"), prompt, "gemini", url, user_ip)
+        
+        return url, prompt

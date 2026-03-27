@@ -304,6 +304,19 @@ footer{max-width:1320px;margin:0 auto;padding:2rem 1.5rem;
 .footer-brand svg{width:15px;height:15px;}
 .footer-links{display:flex;gap:1.5rem;}
 .footer-links span{font-family:var(--mono);font-size:.6rem;text-transform:uppercase;letter-spacing:.12em;}
+
+/* Gallery Section */
+.gallery{max-width:1320px;margin:3rem auto;padding:0 1.5rem;}
+.gallery-hdr{display:flex;align-items:center;justify-content:space-between;margin-bottom:1.5rem;border-bottom:1px solid var(--border);padding-bottom:.75rem;}
+.gallery-hdr h2{font-family:var(--mono);font-size:.68rem;font-weight:700;text-transform:uppercase;letter-spacing:.25em;color:var(--text);}
+.gallery-grid{display:grid;grid-template-columns:repeat(auto-fill, minmax(180px, 1fr));gap:1.5rem;}
+.gallery-item{background:var(--surface);border:1px solid var(--border);border-radius:1rem;overflow:hidden;transition:all .2s;cursor:pointer;display:flex;flex-direction:column;}
+.gallery-item:hover{transform:translateY(-4px);box-shadow:0 12px 24px rgba(0,0,0,.08);border-color:var(--text);}
+.gallery-img-wrap{aspect-ratio:1/1;background:var(--surface2);display:flex;align-items:center;justify-content:center;padding:1rem;}
+.gallery-img-wrap img{max-width:100%;max-height:100%;object-fit:contain;filter:drop-shadow(0 4px 8px rgba(0,0,0,.08));}
+.gallery-info{padding:.75rem;border-top:1px solid var(--border);}
+.gallery-name{font-size:.75rem;font-weight:700;color:var(--text);margin-bottom:.15rem;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}
+.gallery-meta{font-family:var(--mono);font-size:.55rem;text-transform:uppercase;letter-spacing:.05em;color:var(--muted);display:flex;justify-content:space-between;}
 """
 
 # ---------- HTML body (plain string) -----------------------------------------
@@ -566,6 +579,22 @@ HTML = """
   </div>
 </section>
 
+<!-- Gallery Section -->
+<section class="gallery" id="gallerySection">
+  <div class="gallery-hdr">
+    <h2>Recent Generations</h2>
+    <div style="display:flex;gap:.5rem">
+        <button class="adv-toggle" onclick="fetchHistory()" style="font-size:.55rem"><i data-lucide="refresh-cw" style="width:12px;height:12px"></i> Refresh</button>
+    </div>
+  </div>
+  <div class="gallery-grid" id="galleryGrid">
+    <!-- Populated by JS -->
+    <div style="grid-column:1/-1;text-align:center;padding:3rem;color:var(--muted);font-family:var(--mono);font-size:.65rem;text-transform:uppercase;letter-spacing:.15em;">
+        Loading History...
+    </div>
+  </div>
+</section>
+
 <footer>
   <div class="footer-brand"><i data-lucide="sparkles"></i> LogoForge AI System</div>
   <div class="footer-links">
@@ -616,7 +645,55 @@ lucide.createIcons();
   } catch {
     document.getElementById("apiStatusFooter").textContent = "API: Offline \u274c";
   }
+  fetchHistory();
 })();
+
+// ── History / Gallery ──────────────────────────────────────────────────────────
+async function fetchHistory() {
+  try {
+    const r = await fetch(API + "/api/history?limit=12");
+    if (r.ok) {
+      const data = await r.json();
+      renderHistory(data);
+    }
+  } catch (e) {
+    console.error("Failed to fetch history:", e);
+  }
+}
+
+function renderHistory(items) {
+  const grid = document.getElementById("galleryGrid");
+  if (!items || items.length === 0) {
+    grid.innerHTML = '<div style="grid-column:1/-1;text-align:center;padding:3rem;color:var(--muted);font-family:var(--mono);font-size:.65rem;">No history found yet</div>';
+    return;
+  }
+
+  grid.innerHTML = items.map(item => {
+    const src = item.image_url.startsWith("http") ? item.image_url : API + "/static/" + item.image_url.split("\\").join("/");
+    return `
+      <div class="gallery-item" onclick="loadFromHistory('${item.brand_name}', '${src}')">
+        <div class="gallery-img-wrap">
+          <img src="${src}" alt="${item.brand_name}"/>
+        </div>
+        <div class="gallery-info">
+          <div class="gallery-name">${item.brand_name}</div>
+          <div class="gallery-meta">
+            <span>${item.generator}</span>
+            <span>${new Date(item.created_at).toLocaleDateString()}</span>
+          </div>
+        </div>
+      </div>
+    `;
+  }).join("");
+  lucide.createIcons();
+}
+
+function loadFromHistory(brand, src) {
+  document.getElementById("brandName").value = brand;
+  state.logoSrc = src;
+  setCanvasLogo(src, 0);
+  showIdentity(brand, "", src);
+}
 
 // ── Selection helpers ──────────────────────────────────────────────────────────
 function clearActive(gridId) {
@@ -838,6 +915,7 @@ async function generateLogo(isRegen) {
     finishProgress(true);
     setCanvasLogo(imgSrc, state.variationIndex);
     showIdentity(brand, payload.tagline, imgSrc);
+    fetchHistory(); // Refresh history after new generation
 
   } catch (e) {
     clearTimeout(hardTimeout);
