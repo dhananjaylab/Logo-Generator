@@ -23,25 +23,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# ── Static file serving for generated logos ───────────────────────────────────
-# Gemini saves to: generated_logos/gemini/
-# DALL-E saves to: generated_logos/dalle/
-# Both are served under /static/generated_logos/<subdir>/<file>
-# which matches the path the frontend constructs from the returned relative path.
-
-_BASE   = Path("generated_logos")
-_GEMINI = _BASE / "gemini"
-_DALLE  = _BASE / "dalle"
-
-for d in [_BASE, _GEMINI, _DALLE]:
-    d.mkdir(parents=True, exist_ok=True)
-
-# Mount the whole generated_logos tree so sub-paths resolve automatically
-app.mount(
-    "/static/generated_logos",
-    StaticFiles(directory=str(_BASE)),
-    name="generated_logos",
-)
+# ── Endpoints ───────────────────────────────────────────────────────────────
 
 app.include_router(logo_router)
 
