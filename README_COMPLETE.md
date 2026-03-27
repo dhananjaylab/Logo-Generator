@@ -44,11 +44,16 @@ streamlit run streamlit_app.py
 # Opens http://localhost:8501
 ```
 
-**Terminal 3 - Worker:**
+**Terminal 3 - DALL-E Worker:**
 ```bash
 cd backend
-arq worker.WorkerSettings
-# Runs on http://localhost:5050
+arq dalle_worker.WorkerSettings
+```
+
+**Terminal 4 - Gemini Worker:**
+```bash
+cd backend
+arq gemini_worker.WorkerSettings
 ```
 
 ### 4. Generate

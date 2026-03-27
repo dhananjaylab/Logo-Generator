@@ -84,11 +84,14 @@ async def generate_logo(
         variation_index=variation_index,
     )
 
-    # Enqueue the job
+    # Enqueue the job to the specific queue
+    queue_name = "dalle_queue" if request.generator == "dalle-3" else "gemini_queue"
+    function_name = "generate_dalle_task" if request.generator == "dalle-3" else "generate_gemini_task"
+    
     job = await redis.enqueue_job(
-        "generate_logo_task",
-        generator=request.generator,
+        function_name,
         user_ip=user_ip,
+        _queue_name=queue_name,
         **common
     )
 
@@ -100,12 +103,25 @@ async def generate_logo(
 
 @router.get("/jobs/{job_id}", response_model=JobStatusResponse)
 async def get_job_status(job_id: str, redis=Depends(get_redis)):
-    """Check the status of a background job."""
+    """Check the status of a background job across all specialized queues."""
     from arq.jobs import Job
-    job_instance = Job(job_id, redis)
+    
+    # We check all specialized queues to find where the job is currently living
+    queues_to_search = ["dalle_queue", "gemini_queue", "arq:queue"]
+    job_instance = None
+    status = "not_found"
     
     try:
-        status = await job_instance.status()
+        for q in queues_to_search:
+            temp_job = Job(job_id, redis, _queue_name=q)
+            status = await temp_job.status()
+            if status != "not_found":
+                job_instance = temp_job
+                break
+        
+        if not job_instance or status == "not_found":
+            raise HTTPException(404, f"Job {job_id} not found")
+
         result_info = await job_instance.result_info()
         
         if status == "complete" and result_info:
@@ -131,8 +147,6 @@ async def get_job_status(job_id: str, redis=Depends(get_redis)):
                     "palette": result_info.kwargs.get("palette"),
                 }
             }
-        elif status == "not_found":
-            raise HTTPException(404, f"Job {job_id} not found")
         else:
             # Handle JobStatus enum or string
             status_str = status.value if hasattr(status, "value") else str(status)
@@ -140,6 +154,9 @@ async def get_job_status(job_id: str, redis=Depends(get_redis)):
                 "job_id": job_id,
                 "status": status_str
             }
+    except HTTPException:
+        # Re-raise HTTPExceptions to avoid them being caught by the generic block
+        raise
     except Exception as e:
         print(f"[API] Error fetching job status: {e}")
         raise HTTPException(500, f"Error fetching job status: {e}")
