@@ -27,27 +27,73 @@ Fixes in this version
 import io
 import asyncio
 import time
-from pathlib import Path
 from typing import Tuple
 
 import requests as _requests      # synchronous – used in to_thread for DALL-E download
+import boto3
+from botocore.config import Config
 from PIL import Image
 from google import genai
 from google.genai import types
 from openai import AsyncOpenAI
 
-from utils import get_output_path, ensure_output_directory, sanitize_filename
+from utils import sanitize_filename
+from config import (
+    R2_BUCKET_NAME,
+    R2_ACCESS_KEY_ID,
+    R2_SECRET_ACCESS_KEY,
+    R2_ENDPOINT_URL,
+    R2_PUBLIC_DOMAIN,
+)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Output sub-directories
+# Cloudflare R2 / S3 Client
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _gemini_output_dir() -> str:
-    return ensure_output_directory("generated_logos/gemini")
+def get_r2_client():
+    """Initialize a boto3 S3 client for Cloudflare R2."""
+    if not all([R2_ACCESS_KEY_ID, R2_SECRET_ACCESS_KEY, R2_ENDPOINT_URL]):
+        return None
+        
+    return boto3.client(
+        "s3",
+        endpoint_url=R2_ENDPOINT_URL,
+        aws_access_key_id=R2_ACCESS_KEY_ID,
+        aws_secret_access_key=R2_SECRET_ACCESS_KEY,
+        config=Config(signature_version="s3v4"),
+        region_name="auto",  # R2 expects 'auto' or a specific region
+    )
 
-def _dalle_output_dir() -> str:
-    return ensure_output_directory("generated_logos/dalle")
+
+def upload_to_r2(data: bytes, filename: str, content_type: str = "image/png") -> str:
+    """
+    Upload bytes to R2 and return the public URL or S3-compatible path.
+    """
+    client = get_r2_client()
+    if not client or not R2_BUCKET_NAME:
+        print("[R2] ⚠ R2 client or bucket not configured; falling back to local simulation")
+        return f"LOCAL_FALLBACK/{filename}"
+
+    try:
+        client.put_object(
+            Bucket=R2_BUCKET_NAME,
+            Key=filename,
+            Body=data,
+            ContentType=content_type,
+        )
+        # Construct the URL. Use public domain if available, else endpoint+bucket
+        if R2_PUBLIC_DOMAIN:
+            return f"{R2_PUBLIC_DOMAIN}/{filename}"
+        return f"{R2_ENDPOINT_URL}/{R2_BUCKET_NAME}/{filename}"
+    except Exception as exc:
+        print(f"[R2] ⚠ Upload failed: {exc}")
+        return f"UPLOAD_FAILED/{filename}"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Filename Generator
+# ─────────────────────────────────────────────────────────────────────────────
 
 
 def _unique_filename(brand: str, generator: str, variation_index: int) -> str:
@@ -149,7 +195,7 @@ def build_logo_prompt(
 _GEMINI_MODEL_TIMEOUT = 45
 
 _GEMINI_IMAGE_MODELS = [
-   "gemini-3.1-flash-image-preview",  # Latest and best for logos if available
+   "gemini-2.5-flash-image",  # Latest and best for logos if available
 ]
 
 
@@ -215,15 +261,11 @@ class GeminiService:
             for part in response_parts:
                 inline = getattr(part, "inline_data", None)
                 if inline and getattr(inline, "data", None):
-                    img    = Image.open(io.BytesIO(inline.data))
-                    fname  = _unique_filename(text, "gemini", variation_index)
-                    outdir = _gemini_output_dir()
-                    path   = str(Path(outdir) / fname)
-                    img.save(path)
-                    print(f"[Gemini] ✓ saved → {path}")
-                    # Return path relative to generated_logos root for static serving
-                    rel = f"generated_logos/gemini/{fname}"
-                    return rel, prompt
+                    fname = _unique_filename(text, "gemini", variation_index)
+                    # Upload directly to R2
+                    url = await asyncio.to_thread(upload_to_r2, inline.data, f"gemini/{fname}")
+                    print(f"[Gemini] ✓ uploaded → {url}")
+                    return url, prompt
 
             print(f"[Gemini] '{model}': response had no inline image data")
 
@@ -281,23 +323,23 @@ class DALLEService:
 
         image_url = response.data[0].url
 
-        # Download and persist locally
-        fname  = _unique_filename(brand, "dalle", variation_index)
-        outdir = _dalle_output_dir()
-        path   = str(Path(outdir) / fname)
-
+        # Synchronous download
         try:
-            await asyncio.wait_for(
-                asyncio.to_thread(_download_image, image_url, path),
-                timeout=_DALLE_DL_TIMEOUT + 5,
-            )
-            print(f"[DALL-E] ✓ saved → {path}")
-            rel = f"generated_logos/dalle/{fname}"
-            return rel
+            resp = await asyncio.to_thread(_requests.get, image_url, timeout=_DALLE_DL_TIMEOUT)
+            resp.raise_for_status()
+            image_data = resp.content
         except Exception as exc:
-            # If download fails, fall back to the (temporary) URL so the user
-            # still sees something — warn in logs
-            print(f"[DALL-E] ⚠ local save failed ({exc}); returning raw URL")
+            print(f"[DALL-E] ⚠ Download failed ({exc}); returning raw URL")
+            return image_url
+
+        # Upload to R2
+        fname = _unique_filename(brand, "dalle", variation_index)
+        try:
+            url = await asyncio.to_thread(upload_to_r2, image_data, f"dalle/{fname}")
+            print(f"[DALL-E] ✓ uploaded → {url}")
+            return url
+        except Exception as exc:
+            print(f"[DALL-E] ⚠ R2 upload failed ({exc}); returning raw URL")
             return image_url
 
 

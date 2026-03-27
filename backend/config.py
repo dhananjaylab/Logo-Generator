@@ -1,3 +1,15 @@
+import os
+from dotenv import load_dotenv
+
+load_dotenv()
+
+# Cloudflare R2 Configuration
+R2_BUCKET_NAME = os.getenv("R2_BUCKET_NAME")
+R2_ACCESS_KEY_ID = os.getenv("R2_ACCESS_KEY_ID")
+R2_SECRET_ACCESS_KEY = os.getenv("R2_SECRET_ACCESS_KEY")
+R2_ENDPOINT_URL = os.getenv("R2_ENDPOINT_URL")
+R2_PUBLIC_DOMAIN = os.getenv("R2_PUBLIC_DOMAIN", "").rstrip("/")
+
 # Design Constants and Configuration
 
 LOGO_STYLES = {
