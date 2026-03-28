@@ -1,7 +1,7 @@
 import asyncio
 import os
 from typing import List, Optional
-from fastapi import APIRouter, HTTPException, Depends, Request
+from fastapi import APIRouter, HTTPException, Depends, Request, WebSocket, WebSocketDisconnect
 from sqlalchemy import select, desc
 from google import genai
 from openai import AsyncOpenAI
@@ -187,3 +187,70 @@ async def get_generation_history(
     except Exception as e:
         print(f"[DB] ⚠ Failed to fetch history: {e}")
         return []
+
+@router.websocket("/ws/progress/{job_id}")
+async def ws_progress(websocket: WebSocket, job_id: str, redis=Depends(get_redis)):
+    """WebSocket endpoint to push real-time progress for a job."""
+    await websocket.accept()
+    from arq.jobs import Job
+    import asyncio
+    
+    queues = ["dalle_queue", "gemini_queue", "arq:queue"]
+    
+    try:
+        while True:
+            status = "not_found"
+            job_instance = None
+            for q in queues:
+                temp_job = Job(job_id, redis, _queue_name=q)
+                temp_status = await temp_job.status()
+                # Handle enum string value mapping properly
+                temp_status_str = temp_status.value if hasattr(temp_status, "value") else str(temp_status)
+                if temp_status_str != "not_found":
+                    status = temp_status_str
+                    job_instance = temp_job
+                    break
+                    
+            if not job_instance or status == "not_found":
+                # Polling might hit before job is visible.
+                await websocket.send_json({"status": "queued"})
+                await asyncio.sleep(1)
+                continue
+                
+            if status == "complete":
+                info = await job_instance.result_info()
+                if info and info.result:
+                    res_data = info.result
+                    if res_data.get("status") == "failed":
+                         await websocket.send_json({"status": "failed", "error": res_data.get("error")})
+                    else:
+                        await websocket.send_json({
+                            "status": "completed",
+                            "result": {
+                                "result": res_data.get("result"),
+                                "generator": res_data.get("generator"),
+                                "prompt": res_data.get("prompt"),
+                                "brand": info.kwargs.get("text"),
+                                "style": info.kwargs.get("style"),
+                                "palette": info.kwargs.get("palette"),
+                            }
+                        })
+                else:
+                    await websocket.send_json({"status": "completed"})
+                break
+                
+            elif status == "in_progress":
+                await websocket.send_json({"status": "in_progress"})
+                await asyncio.sleep(2)
+            else:
+                await websocket.send_json({"status": status})
+                await asyncio.sleep(2)
+                
+    except WebSocketDisconnect:
+        pass
+    except Exception as e:
+        print(f"[WS] Error: {e}")
+        try:
+            await websocket.close()
+        except:
+            pass
