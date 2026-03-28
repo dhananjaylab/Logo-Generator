@@ -595,6 +595,21 @@ HTML = """
   </div>
 </section>
 
+    </div>
+  </div>
+</section>
+
+<!-- Auth Modal (Simple Overlay) -->
+<div id="authOverlay" style="display:none;position:fixed;top:0;left:0;width:100%;height:100%;background:rgba(0,0,0,0.85);z-index:1000;align-items:center;justify-content:center;color:#fff;text-align:center;padding:2rem;backdrop-filter:blur(8px);">
+  <div style="max-width:400px;background:var(--dark);padding:2.5rem;border-radius:1.5rem;border:1px solid rgba(255,255,255,0.1);box-shadow:0 32px 64px rgba(0,0,0,0.5);">
+    <i data-lucide="lock" style="width:48px;height:48px;margin-bottom:1.5rem;color:var(--red);"></i>
+    <h2 style="font-family:var(--font);margin-bottom:1rem;">Authentication Required</h2>
+    <p style="font-size:0.9rem;color:rgba(255,255,255,0.6);margin-bottom:2rem;line-height:1.5;">Please enter your developer token to continue forging logos. This protects API credits.</p>
+    <input type="password" id="tokenInput" placeholder="Enter Token" style="margin-bottom:1rem;background:rgba(255,255,255,0.05);border:1px solid rgba(255,255,255,0.1);color:#fff;"/>
+    <button class="gen-btn" style="width:100%;" onclick="saveToken()">Connect API</button>
+  </div>
+</div>
+
 <footer>
   <div class="footer-brand"><i data-lucide="sparkles"></i> LogoForge AI System</div>
   <div class="footer-links">
@@ -619,6 +634,7 @@ const state = {
   generating:     false,
   variationIndex: 0,
   abortCtrl:      null,
+  token:          localStorage.getItem("logoform_token") || "",
 };
 
 // Variation directions rotated on each Regenerate click
@@ -646,12 +662,27 @@ lucide.createIcons();
     document.getElementById("apiStatusFooter").textContent = "API: Offline \u274c";
   }
   fetchHistory();
+  if (!state.token) {
+    document.getElementById("authOverlay").style.display = "flex";
+  }
 })();
+
+function saveToken() {
+  const t = document.getElementById("tokenInput").value.trim();
+  if (!t) return;
+  state.token = t;
+  localStorage.setItem("logoform_token", t);
+  document.getElementById("authOverlay").style.display = "none";
+  fetchHistory();
+}
 
 // ── History / Gallery ──────────────────────────────────────────────────────────
 async function fetchHistory() {
   try {
-    const r = await fetch(API + "/api/history?limit=12");
+    const headers = {};
+    if (state.token) headers["Authorization"] = "Bearer " + state.token;
+    
+    const r = await fetch(API + "/api/history?limit=12", { headers });
     if (r.ok) {
       const data = await r.json();
       renderHistory(data);
@@ -888,14 +919,26 @@ async function generateLogo(isRegen) {
   };
 
   try {
+    const headers = { "Content-Type": "application/json" };
+    if (state.token) headers["Authorization"] = "Bearer " + state.token;
+
     const r = await fetch(API + "/api/generate", {
       method:  "POST",
-      headers: { "Content-Type": "application/json" },
+      headers: headers,
       body:    JSON.stringify(payload),
       signal:  ctrl.signal,
     });
 
     if (!r.ok) {
+      if (r.status === 401) {
+        localStorage.removeItem("logoform_token");
+        state.token = "";
+        document.getElementById("authOverlay").style.display = "flex";
+        throw new Error("Authentication expired or invalid.");
+      }
+      if (r.status === 429) {
+        throw new Error("Rate limit exceeded. Please wait a moment.");
+      }
       const d = await r.json().catch(() => ({}));
       throw new Error(d.detail || "HTTP " + r.status);
     }
