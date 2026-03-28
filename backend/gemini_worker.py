@@ -2,11 +2,11 @@ import asyncio
 from arq import worker
 from google import genai
 
-from config import REDIS_URL
+from config import REDIS_URL, REDIS_SETTINGS
 from services import LLMService
 from dependencies import Clients
 
-async def generate_gemini_task(ctx, user_ip: str, **kwargs):
+async def generate_gemini_task(ctx, user_ip: str, user_id: str, **kwargs):
     """
     Background task to generate a logo using Gemini.
     """
@@ -16,7 +16,7 @@ async def generate_gemini_task(ctx, user_ip: str, **kwargs):
     print(f"[Gemini Worker] Starting generation for {kwargs.get('text')}")
     
     try:
-        path, prompt = await llm.generate_logo_with_gemini(user_ip=user_ip, **kwargs)
+        path, prompt = await llm.generate_logo_with_gemini(user_ip=user_ip, user_id=user_id, **kwargs)
         return {"result": [path], "generator": "gemini", "prompt": prompt, "status": "completed"}
     except Exception as exc:
         print(f"[Gemini Worker] Generation failed: {exc}")
@@ -34,7 +34,7 @@ class WorkerSettings:
     ARQ worker settings for Gemini.
     """
     functions = [generate_gemini_task]
-    redis_settings = worker.RedisSettings.from_dsn(REDIS_URL)
+    redis_settings = REDIS_SETTINGS
     queue_name = 'gemini_queue'
     on_startup = startup
     on_shutdown = shutdown

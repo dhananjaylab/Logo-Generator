@@ -3,11 +3,11 @@ from arq import worker
 from google import genai
 from openai import AsyncOpenAI
 
-from config import REDIS_URL
+from config import REDIS_URL, REDIS_SETTINGS
 from services import LLMService
 from dependencies import Clients
 
-async def generate_dalle_task(ctx, user_ip: str, **kwargs):
+async def generate_dalle_task(ctx, user_ip: str, user_id: str, **kwargs):
     """
     Background task to generate a logo using DALL-E 3.
     """
@@ -17,7 +17,7 @@ async def generate_dalle_task(ctx, user_ip: str, **kwargs):
     print(f"[DALL-E Worker] Starting generation for {kwargs.get('text')}")
     
     try:
-        path, prompt = await llm.generate_logo_with_dalle(user_ip=user_ip, **kwargs)
+        path, prompt = await llm.generate_logo_with_dalle(user_ip=user_ip, user_id=user_id, **kwargs)
         return {"result": [path], "generator": "dalle-3", "prompt": prompt, "status": "completed"}
     except Exception as exc:
         print(f"[DALL-E Worker] Generation failed: {exc}")
@@ -35,7 +35,7 @@ class WorkerSettings:
     ARQ worker settings for DALL-E.
     """
     functions = [generate_dalle_task]
-    redis_settings = worker.RedisSettings.from_dsn(REDIS_URL)
+    redis_settings = REDIS_SETTINGS
     queue_name = 'dalle_queue'
     on_startup = startup
     on_shutdown = shutdown

@@ -359,7 +359,8 @@ class LLMService:
         prompt: str, 
         generator: str, 
         url: str, 
-        ip: str = None
+        ip: str = None,
+        user_id: str = None
     ) -> None:
         """Asynchronously save generation metadata to PostgreSQL."""
         if not AsyncSessionLocal:
@@ -373,7 +374,8 @@ class LLMService:
                     prompt=prompt,
                     generator=generator,
                     image_url=url,
-                    ip_address=ip
+                    ip_address=ip,
+                    user_id=user_id
                 )
                 session.add(new_entry)
                 await session.commit()
@@ -383,17 +385,19 @@ class LLMService:
                 await session.rollback()
 
     async def generate_logo_with_dalle(self, user_ip: str = None, **kwargs) -> Tuple[str, str]:
+        user_id         = kwargs.pop("user_id", None)
         variation_index = kwargs.pop("variation_index", 0)
         text            = kwargs.get("text", "logo")
         prompt          = build_logo_prompt(**kwargs, variation_index=variation_index)
         local_path      = await self.dalle.generate_logo(prompt, brand=text, variation_index=variation_index)
         
         # Save to DB
-        await self._save_to_db(text, prompt, "dalle-3", local_path, user_ip)
+        await self._save_to_db(text, prompt, "dalle-3", local_path, user_ip, user_id)
         
         return local_path, prompt
 
     async def generate_logo_with_gemini(self, user_ip: str = None, **kwargs) -> Tuple[str, str]:
+        user_id = kwargs.pop("user_id", None)
         url, prompt = await self.gemini.generate_logo(**kwargs)
         
         # Save to DB

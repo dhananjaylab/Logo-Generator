@@ -1,4 +1,5 @@
 import asyncio
+import os
 from typing import List, Optional
 from fastapi import APIRouter, HTTPException, Depends, Request
 from sqlalchemy import select, desc
@@ -16,8 +17,9 @@ from models import (
 )
 from services import LLMService
 from database import get_db, LogoGeneration
-from dependencies import get_gemini_client, get_openai_client, Clients
-from config import LOGO_STYLES, COLOR_PALETTES, SUPPORTED_GENERATORS, REDIS_URL
+from dependencies import get_gemini_client, get_openai_client, Clients, validate_clerk_token
+from config import LOGO_STYLES, COLOR_PALETTES, SUPPORTED_GENERATORS, REDIS_URL, REDIS_SETTINGS
+from limiter import limiter
 
 router = APIRouter(prefix="/api", tags=["logo"])
 
@@ -26,7 +28,7 @@ _ROUTE_TIMEOUT = 90   # hard ceiling for the entire /generate request (s)
 
 async def get_redis():
     """Dependency to get ARQ redis pool"""
-    return await create_pool(RedisSettings.from_dsn(REDIS_URL))
+    return await create_pool(REDIS_SETTINGS)
 
 
 @router.get("/health", response_model=HealthResponse)
@@ -39,19 +41,24 @@ async def health_check():
 
 
 @router.post("/generate", response_model=LogoJobResponse)
+@limiter.limit(os.getenv("RATE_LIMIT_PER_MINUTE", "10/minute"))
+@limiter.limit(os.getenv("RATE_LIMIT_PER_DAY", "200/day"))
 async def generate_logo(
-    request: LogoGenerationRequest,
-    fastapi_request: Request,
+    logo_request: LogoGenerationRequest,
+    request: Request,
     redis=Depends(get_redis),
     gemini_client: genai.Client = Depends(get_gemini_client),
     openai_client: AsyncOpenAI  = Depends(get_openai_client),
+    user: dict = Depends(validate_clerk_token),
 ):
-    user_ip = fastapi_request.client.host if fastapi_request.client else None
+    user_ip = request.client.host if request.client else None
+    user_id = user.get("sub", "anonymous")
+    print(f"[API] Logo request from user: {user_id} (IP: {user_ip})")
     # ── Validate ──────────────────────────────────────────────────────────
-    if request.generator == "dalle-3":
+    if logo_request.generator == "dalle-3":
         if not openai_client:
             raise HTTPException(500, "OpenAI API client not initialised.")
-    elif request.generator == "gemini":
+    elif logo_request.generator == "gemini":
         if not gemini_client:
             raise HTTPException(500, "Gemini API client not initialised.")
     else:
@@ -60,37 +67,38 @@ async def generate_logo(
             f"Invalid generator. Choose from: {', '.join(SUPPORTED_GENERATORS)}",
         )
 
-    if request.style not in LOGO_STYLES:
+    if logo_request.style not in LOGO_STYLES:
         raise HTTPException(400, f"Invalid style. Choose from: {', '.join(LOGO_STYLES.keys())}")
-    if request.palette not in COLOR_PALETTES:
+    if logo_request.palette not in COLOR_PALETTES:
         raise HTTPException(400, f"Invalid palette. Choose from: {', '.join(COLOR_PALETTES.keys())}")
-    if not request.text and not request.description:
+    if not logo_request.text and not logo_request.description:
         raise HTTPException(400, "Provide at least a brand name or description.")
 
     # Extract variation_index (0 = first generation, >0 = regeneration)
-    variation_index = getattr(request, "variation_index", 0) or 0
+    variation_index = getattr(logo_request, "variation_index", 0) or 0
 
     common = dict(
-        text=request.text,
-        description=request.description or "",
-        style=LOGO_STYLES.get(request.style, LOGO_STYLES["minimalist"]),
-        palette=COLOR_PALETTES.get(request.palette, COLOR_PALETTES["monochrome"]),
-        tagline=request.tagline or "",
-        typography=request.typography or "",
-        elements_to_include=request.elements_to_include or "",
-        elements_to_avoid=request.elements_to_avoid or "",
-        brand_mission=request.brand_mission or "",
-        variation_hint=request.variation_hint or "",
+        text=logo_request.text,
+        description=logo_request.description or "",
+        style=LOGO_STYLES.get(logo_request.style, LOGO_STYLES["minimalist"]),
+        palette=COLOR_PALETTES.get(logo_request.palette, COLOR_PALETTES["monochrome"]),
+        tagline=logo_request.tagline or "",
+        typography=logo_request.typography or "",
+        elements_to_include=logo_request.elements_to_include or "",
+        elements_to_avoid=logo_request.elements_to_avoid or "",
+        brand_mission=logo_request.brand_mission or "",
+        variation_hint=logo_request.variation_hint or "",
         variation_index=variation_index,
     )
 
     # Enqueue the job to the specific queue
-    queue_name = "dalle_queue" if request.generator == "dalle-3" else "gemini_queue"
-    function_name = "generate_dalle_task" if request.generator == "dalle-3" else "generate_gemini_task"
+    queue_name = "dalle_queue" if logo_request.generator == "dalle-3" else "gemini_queue"
+    function_name = "generate_dalle_task" if logo_request.generator == "dalle-3" else "generate_gemini_task"
     
     job = await redis.enqueue_job(
         function_name,
         user_ip=user_ip,
+        user_id=user_id,
         _queue_name=queue_name,
         **common
     )
