@@ -24,8 +24,6 @@ async def lifespan(app: FastAPI):
     # Startup: Initialize database
     await init_db()
     yield
-    # Shutdown: Clean up if needed
-    pass
 
 app = FastAPI(
     title="Logo Generator API",
