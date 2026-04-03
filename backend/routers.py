@@ -113,13 +113,16 @@ async def get_job_status(
     redis=Depends(get_redis),
     user: dict = Depends(validate_clerk_token),
 ):
-    """Check the status of a background job across all specialized queues (requires authentication)."""
+    """
+    Check the status of a background job (requires authentication).
+    Verifies job ownership to prevent enumeration attacks.
+    """
     user_id = user.get("sub", "anonymous")
     print(f"[API] Job status request from user: {user_id}, job: {job_id}")
     
     from arq.jobs import Job
     
-    # We check all specialized queues to find where the job is currently living
+    # Check all specialized queues to find where the job is currently living
     queues_to_search = ["dalle_queue", "gemini_queue", "arq:queue"]
     job_instance = None
     status = "not_found"
@@ -137,9 +140,11 @@ async def get_job_status(
 
         result_info = await job_instance.result_info()
         
-        # Optional: Verify job belongs to requesting user (if user_id was stored)
+        # ── Job Ownership Check ─────────────────────────────────────────────
+        # Verify the job belongs to the requesting user (prevent enumeration)
         job_user_id = result_info.kwargs.get("user_id") if result_info else None
         if job_user_id and job_user_id != user_id and user_id != "developer":
+            print(f"[API] Job ownership check failed: {job_user_id} != {user_id}")
             raise HTTPException(403, "You don't have permission to access this job")
         
         if status == "complete" and result_info:
@@ -194,8 +199,14 @@ async def get_generation_history(
         return []
         
     try:
-        # Optionally filter by user_id if available
-        stmt = select(LogoGeneration).order_by(desc(LogoGeneration.created_at)).limit(limit)
+        # Filter by user_id to prevent enumeration attacks
+        # Only return the user's own generations
+        stmt = (
+            select(LogoGeneration)
+            .where(LogoGeneration.user_id == user_id)  # Job ownership check
+            .order_by(desc(LogoGeneration.created_at))
+            .limit(limit)
+        )
         result = await db.execute(stmt)
         history = result.scalars().all()
         return history
@@ -209,7 +220,11 @@ async def ws_progress(
     job_id: str,
     token: str = None  # Token can be passed as query param
 ):
-    """WebSocket endpoint to push real-time progress for a job (requires authentication)."""
+    """
+    WebSocket endpoint to push real-time progress for a job.
+    Requires authentication. Falls back to HTTP polling if WebSocket fails.
+    Implements exponential backoff to reduce chattiness under load.
+    """
     from arq.jobs import Job
     import asyncio
     from urllib.parse import unquote
@@ -219,39 +234,51 @@ async def ws_progress(
         token = unquote(websocket.query_params["token"])
     
     # Validate token before accepting connection
+    user_id = None
+    is_production = os.getenv("ENV") == "production"
+    dev_token = os.getenv("DEV_TOKEN")
+    
     try:
         if not token:
             await websocket.close(code=1008, reason="Missing authentication token")
             return
-            
-        # Validate the token (you may need to adjust this based on your auth setup)
+        
         from dependencies import ClerkAuthProvider
         from jose import jwt
         
-        # For dev/demo: check if it's a dev token
-        dev_token = os.getenv("DEV_TOKEN")
+        # Check dev token first (only in non-prod)
         if dev_token and token == dev_token:
+            if is_production:
+                await websocket.close(code=1008, reason="Dev tokens not allowed in production")
+                return
             print("[WS] ✅ Authorized via DEV_TOKEN")
-            # Token is valid, continue
+            user_id = "developer"
         else:
-            # Try to validate as Clerk JWT
+            # Validate as Clerk JWT
             jwks = await ClerkAuthProvider.get_jwks()
             if jwks:
                 try:
+                    audience = os.getenv("CLERK_AUDIENCE", os.getenv("NEXT_PUBLIC_API_URL", "http://localhost:3000"))
                     payload = jwt.decode(
                         token, 
                         jwks, 
                         algorithms=["RS256"],
-                        options={"verify_aud": False}
+                        audience=audience if is_production else None,
+                        options={"verify_aud": is_production}
                     )
-                    print(f"[WS] ✅ Authorized user: {payload.get('sub')}")
+                    user_id = payload.get("sub")
+                    print(f"[WS] ✅ Authorized user: {user_id}")
                 except Exception as e:
                     print(f"[WS] ❌ Token validation failed: {e}")
                     await websocket.close(code=1008, reason="Invalid authentication token")
                     return
             else:
-                # If JWKS not configured, warn but allow (dev mode)
+                if is_production:
+                    await websocket.close(code=1011, reason="Authentication service unavailable")
+                    return
+                # In dev, allow if JWKS not configured
                 print("[WS] ⚠ Skipping token validation - JWKS not configured")
+                user_id = "anonymous"
     except Exception as e:
         print(f"[WS] ❌ Auth check error: {e}")
         await websocket.close(code=1011, reason="Authentication error")
@@ -260,36 +287,56 @@ async def ws_progress(
     # Accept the connection
     await websocket.accept()
     
-    # Get redis pool from app state (created at startup)
+    # Get redis pool from app state
     redis = websocket.app.state.redis
     queues = ["dalle_queue", "gemini_queue", "arq:queue"]
     
+    # Exponential backoff for polling (1s -> 2s -> 4s max)
+    min_poll_interval = 0.5
+    max_poll_interval = 4.0
+    current_poll_interval = min_poll_interval
+    
     try:
+        consecutive_not_found = 0
         while True:
             status = "not_found"
             job_instance = None
+            
             for q in queues:
                 temp_job = Job(job_id, redis, _queue_name=q)
                 temp_status = await temp_job.status()
-                # Handle enum string value mapping properly
                 temp_status_str = temp_status.value if hasattr(temp_status, "value") else str(temp_status)
                 if temp_status_str != "not_found":
                     status = temp_status_str
                     job_instance = temp_job
+                    consecutive_not_found = 0  # Reset backoff
                     break
-                    
+            
             if not job_instance or status == "not_found":
-                # Polling might hit before job is visible.
+                consecutive_not_found += 1
+                # Exponential backoff: increase poll interval
+                current_poll_interval = min(
+                    max_poll_interval,
+                    min_poll_interval * (2 ** (consecutive_not_found - 1))
+                )
                 await websocket.send_json({"status": "queued"})
-                await asyncio.sleep(1)
+                await asyncio.sleep(current_poll_interval)
                 continue
                 
             if status == "complete":
                 info = await job_instance.result_info()
+                
+                # Job ownership check: verify user_id matches
+                job_user_id = info.kwargs.get("user_id") if info else None
+                if job_user_id and job_user_id != user_id and user_id != "developer":
+                    print(f"[WS] ❌ Job ownership check failed: {job_user_id} != {user_id}")
+                    await websocket.send_json({"status": "failed", "error": "Unauthorized"})
+                    break
+                
                 if info and info.result:
                     res_data = info.result
                     if res_data.get("status") == "failed":
-                         await websocket.send_json({"status": "failed", "error": res_data.get("error")})
+                        await websocket.send_json({"status": "failed", "error": res_data.get("error")})
                     else:
                         await websocket.send_json({
                             "status": "completed",
@@ -308,15 +355,20 @@ async def ws_progress(
                 
             elif status == "in_progress":
                 await websocket.send_json({"status": "in_progress"})
-                await asyncio.sleep(2)
+                current_poll_interval = min_poll_interval  # Reset during active processing
+                await asyncio.sleep(current_poll_interval)
             else:
                 await websocket.send_json({"status": status})
-                await asyncio.sleep(2)
+                await asyncio.sleep(current_poll_interval)
                 
     except WebSocketDisconnect:
-        pass
+        print(f"[WS] Client disconnected for job {job_id}")
     except Exception as e:
         print(f"[WS] Error: {e}")
+        try:
+            await websocket.send_json({"status": "error", "error": str(e)})
+        except:
+            pass
         try:
             await websocket.close()
         except:
