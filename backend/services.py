@@ -390,11 +390,48 @@ class LLMService:
                 await session.rollback()
 
     async def generate_logo_with_dalle(self, user_ip: str = None, **kwargs) -> Tuple[str, str]:
-        user_id         = kwargs.pop("user_id", None)
+        """
+        Generate a logo using DALL-E 3.
+        
+        Explicitly extracts parameters from kwargs to avoid collisions
+        where 'text' or other parameter names could shadow function arguments.
+        """
+        # Extract special parameters that aren't part of the prompt
+        user_id = kwargs.pop("user_id", None)
         variation_index = kwargs.pop("variation_index", 0)
-        text            = kwargs.get("text", "logo")
-        prompt          = build_logo_prompt(**kwargs, variation_index=variation_index)
-        local_path      = await self.dalle.generate_logo(prompt, brand=text, variation_index=variation_index)
+        
+        # Extract all prompt-building parameters explicitly
+        text = kwargs.pop("text", "logo")
+        description = kwargs.pop("description", "")
+        style = kwargs.pop("style", "minimalist")
+        palette = kwargs.pop("palette", "monochrome")
+        tagline = kwargs.pop("tagline", "")
+        typography = kwargs.pop("typography", "")
+        elements_to_include = kwargs.pop("elements_to_include", "")
+        elements_to_avoid = kwargs.pop("elements_to_avoid", "")
+        brand_mission = kwargs.pop("brand_mission", "")
+        variation_hint = kwargs.pop("variation_hint", "")
+        
+        # Any remaining kwargs would be an error, so we could log them
+        if kwargs:
+            print(f"[DALL-E] ⚠ Unexpected kwargs: {kwargs.keys()}")
+        
+        # Build prompt with explicit parameters (no ** unpacking)
+        prompt = build_logo_prompt(
+            text=text,
+            description=description,
+            style=style,
+            palette=palette,
+            tagline=tagline,
+            typography=typography,
+            elements_to_include=elements_to_include,
+            elements_to_avoid=elements_to_avoid,
+            brand_mission=brand_mission,
+            variation_hint=variation_hint,
+            variation_index=variation_index,
+        )
+        
+        local_path = await self.dalle.generate_logo(prompt, brand=text, variation_index=variation_index)
         
         # Save to DB
         await self._save_to_db(text, prompt, "dalle-3", local_path, user_ip, user_id)
@@ -402,11 +439,47 @@ class LLMService:
         return local_path, prompt
 
     async def generate_logo_with_gemini(self, user_ip: str = None, **kwargs) -> Tuple[str, str]:
+        """
+        Generate a logo using Gemini.
+        
+        Explicitly extracts parameters from kwargs to avoid collisions.
+        """
+        # Extract special parameters that aren't part of the prompt
         user_id = kwargs.pop("user_id", None)
         variation_index = kwargs.pop("variation_index", 0)
-        url, prompt = await self.gemini.generate_logo(**kwargs, variation_index=variation_index)
+        
+        # Extract all prompt-building parameters explicitly
+        text = kwargs.pop("text", "logo")
+        description = kwargs.pop("description", "")
+        style = kwargs.pop("style", "minimalist")
+        palette = kwargs.pop("palette", "monochrome")
+        tagline = kwargs.pop("tagline", "")
+        typography = kwargs.pop("typography", "")
+        elements_to_include = kwargs.pop("elements_to_include", "")
+        elements_to_avoid = kwargs.pop("elements_to_avoid", "")
+        brand_mission = kwargs.pop("brand_mission", "")
+        variation_hint = kwargs.pop("variation_hint", "")
+        
+        # Any remaining kwargs would be an error, so we could log them
+        if kwargs:
+            print(f"[Gemini] ⚠ Unexpected kwargs: {kwargs.keys()}")
+        
+        # Call generate_logo with explicit parameters (no ** unpacking)
+        url, prompt = await self.gemini.generate_logo(
+            text=text,
+            description=description,
+            style=style,
+            palette=palette,
+            tagline=tagline,
+            typography=typography,
+            elements_to_include=elements_to_include,
+            elements_to_avoid=elements_to_avoid,
+            brand_mission=brand_mission,
+            variation_hint=variation_hint,
+            variation_index=variation_index,
+        )
         
         # Save to DB
-        await self._save_to_db(kwargs.get("text", "logo"), prompt, "gemini", url, user_ip)
+        await self._save_to_db(text, prompt, "gemini", url, user_ip, user_id)
         
         return url, prompt

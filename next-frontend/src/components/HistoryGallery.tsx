@@ -4,36 +4,34 @@ import React, { useEffect, useState, useCallback } from 'react';
 import { RefreshCw, ChevronDown } from 'lucide-react';
 import styles from '../app/page.module.css';
 import { resolveImageUrl } from '../lib/imageUrl';
+import { getApiUrl, authenticatedFetch } from '../lib/auth';
+import type { HistoryEntry } from '../lib/types';
 
-const API_URL = 'http://localhost:8000';
-
-interface HistoryItem {
-  id: number;
-  brand_name: string;
-  image_url: string;
-  generator: string;
-  created_at: string;
-}
+interface HistoryItem extends HistoryEntry {}
 
 export default function HistoryGallery({ 
   onSelect, token 
 }: { 
   onSelect: (brand: string, logoSrc: string) => void,
-  token: string 
+  token: string | null
 }) {
   const [history, setHistory] = useState<HistoryItem[]>([]);
   const [loading, setLoading] = useState(true);
   const [open, setOpen] = useState(true);
 
   const fetchHistory = useCallback(async () => {
+    if (!token) {
+      console.log("[HistoryGallery] Waiting for authentication token");
+      return;
+    }
+
     try {
       setLoading(true);
+      const API_URL = getApiUrl();
       const url = `${API_URL}/api/history?limit=12`;
-      console.log("[HistoryGallery] Fetching from:", url, "with token:", token);
+      console.log("[HistoryGallery] Fetching from:", url);
       
-      const res = await fetch(url, {
-        headers: { 'Authorization': `Bearer ${token}` }
-      });
+      const res = await authenticatedFetch(url, {}, token);
       
       console.log("[HistoryGallery] Response status:", res.status);
       

@@ -1,15 +1,13 @@
 'use client';
 
-import React, { useState, useEffect, useRef, useMemo } from 'react';
+import React, { useState, useEffect, useRef } from 'react';
 import { Sparkles, Type, Cpu, Layers, Palette, Image as ImageIcon, Download, RefreshCw, ChevronDown, Target, Quote, CheckCircle2, Ban, Briefcase } from 'lucide-react';
 import styles from './page.module.css';
 import HistoryGallery from '../components/HistoryGallery';
 import IdentityPreview from '../components/IdentityPreview';
 import { resolveImageUrl } from '../lib/imageUrl';
-
-// Config
-const API_URL = 'http://localhost:8000';
-const WS_URL = 'ws://localhost:8000';
+import { getAuthToken, getApiUrl, getWsUrl, authenticatedFetch } from '../lib/auth';
+import type { LogoGenerationResponse, JobStatusResponse } from '../lib/types';
 
 export default function LogoForge() {
   const [generator, setGenerator] = useState('dalle-3');
@@ -24,8 +22,9 @@ export default function LogoForge() {
   const [logoSrc, setLogoSrc] = useState<string | null>(null);
   const [variationIndex, setVariationIndex] = useState(0);
   
-  // Stabilize token reference to prevent HistoryGallery re-fetches
-  const token = useMemo(() => 'logo-forge-dev-2026', []);
+  // Authentication token - fetched from Clerk or env
+  const [token, setToken] = useState<string | null>(null);
+  const [authLoading, setAuthLoading] = useState(true);
 
   const [advOpen, setAdvOpen] = useState(false);
   const [tagline, setTagline] = useState('');
@@ -36,6 +35,21 @@ export default function LogoForge() {
 
   const wsRef = useRef<WebSocket | null>(null);
   const progressSimRef = useRef<NodeJS.Timeout | null>(null);
+
+  // Initialize auth token on mount
+  useEffect(() => {
+    const initAuth = async () => {
+      try {
+        const authToken = await getAuthToken();
+        setToken(authToken);
+      } catch (err) {
+        console.error("[Auth] Failed to initialize token:", err);
+      } finally {
+        setAuthLoading(false);
+      }
+    };
+    initAuth();
+  }, []);
 
   // Cleanup WebSocket and intervals on component unmount
   useEffect(() => {
@@ -60,10 +74,10 @@ export default function LogoForge() {
   };
 
   // Helper: process job result (from WebSocket or polling)
-  const handleJobResult = (result: any, isError: boolean = false) => {
+  const handleJobResult = (result: LogoGenerationResponse | null, isError: boolean = false) => {
     if (progressSimRef.current) clearInterval(progressSimRef.current);
     if (isError) {
-      alert(`Error: ${result.error || result}`);
+      alert(`Error: ${(result as any)?.error || result}`);
       setGenerating(false);
       return;
     }
@@ -72,9 +86,13 @@ export default function LogoForge() {
     setProgressLabel('Complete');
     
     if (result && result.result) {
-      let imgUrl = typeof result.result === 'string' 
-        ? result.result 
-        : (Array.isArray(result.result) ? result.result[0] : result.result.image_url);
+      // Handle both string and array result shapes
+      let imgUrl: string | undefined;
+      if (typeof result.result === 'string') {
+        imgUrl = result.result;
+      } else if (Array.isArray(result.result) && result.result.length > 0) {
+        imgUrl = result.result[0];
+      }
       
       if (imgUrl) {
         setLogoSrc(resolveImageUrl(imgUrl));
@@ -85,6 +103,7 @@ export default function LogoForge() {
 
   const handleGenerate = async (isRegen = false) => {
     if (!brandName && !description) return alert("Provide brand name or description");
+    if (!token) return alert("Authentication required. Please reload the page.");
     
     let newVariation = variationIndex;
     if (isRegen) {
@@ -101,16 +120,22 @@ export default function LogoForge() {
     simulateProgress(5, generator === 'dalle-3' ? 12000 : 8000);
     setLogoSrc(null);
 
+    const API_URL = getApiUrl();
+    const WS_URL = getWsUrl();
+
     try {
       // 1. HTTP Post to Enqueue Job
-      const res = await fetch(`${API_URL}/api/generate`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${token}` },
-        body: JSON.stringify({
-          generator, style, palette, text: brandName, description, variation_index: newVariation,
-          tagline, typography, elements_to_include: elemInclude, elements_to_avoid: elemAvoid, brand_mission: mission
-        })
-      });
+      const res = await authenticatedFetch(
+        `${API_URL}/api/generate`,
+        {
+          method: 'POST',
+          body: JSON.stringify({
+            generator, style, palette, text: brandName, description, variation_index: newVariation,
+            tagline, typography, elements_to_include: elemInclude, elements_to_avoid: elemAvoid, brand_mission: mission
+          })
+        },
+        token
+      );
       
       const data = await res.json();
       if (!res.ok) throw new Error(data.detail || "Generation Failed");
@@ -118,7 +143,7 @@ export default function LogoForge() {
       const jobId = data.job_id;
       
       // 2. Connect WebSocket to listen for progress
-      const ws = new WebSocket(`${WS_URL}/api/ws/progress/${jobId}`);
+      const ws = new WebSocket(`${WS_URL}/api/ws/progress/${jobId}?token=${encodeURIComponent(token)}`);
       wsRef.current = ws;
 
       ws.onmessage = (event) => {
@@ -142,13 +167,15 @@ export default function LogoForge() {
         const poll = setInterval(async () => {
           pollAttempts++;
           try {
-            const pollRes = await fetch(`${API_URL}/api/jobs/${jobId}`, {
-              headers: { 'Authorization': `Bearer ${token}` }
-            });
+            const pollRes = await authenticatedFetch(
+              `${API_URL}/api/jobs/${jobId}`,
+              {},
+              token
+            );
             if (!pollRes.ok) throw new Error("Poll failed");
             
-            const jobData = await pollRes.json();
-            if (jobData.status === 'completed') {
+            const jobData: JobStatusResponse = await pollRes.json();
+            if (jobData.status === 'completed' && jobData.result) {
               clearInterval(poll);
               handleJobResult(jobData.result);
             } else if (jobData.status === 'failed') {
@@ -159,7 +186,7 @@ export default function LogoForge() {
             console.error("Polling error:", pollErr);
             if (pollAttempts >= maxAttempts) {
               clearInterval(poll);
-              handleJobResult("Polling timeout", true);
+              handleJobResult(null, true);
             }
           }
         }, 2000);

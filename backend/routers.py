@@ -108,8 +108,15 @@ async def generate_logo(
 
 
 @router.get("/jobs/{job_id}", response_model=JobStatusResponse)
-async def get_job_status(job_id: str, redis=Depends(get_redis)):
-    """Check the status of a background job across all specialized queues."""
+async def get_job_status(
+    job_id: str, 
+    redis=Depends(get_redis),
+    user: dict = Depends(validate_clerk_token),
+):
+    """Check the status of a background job across all specialized queues (requires authentication)."""
+    user_id = user.get("sub", "anonymous")
+    print(f"[API] Job status request from user: {user_id}, job: {job_id}")
+    
     from arq.jobs import Job
     
     # We check all specialized queues to find where the job is currently living
@@ -129,6 +136,11 @@ async def get_job_status(job_id: str, redis=Depends(get_redis)):
             raise HTTPException(404, f"Job {job_id} not found")
 
         result_info = await job_instance.result_info()
+        
+        # Optional: Verify job belongs to requesting user (if user_id was stored)
+        job_user_id = result_info.kwargs.get("user_id") if result_info else None
+        if job_user_id and job_user_id != user_id and user_id != "developer":
+            raise HTTPException(403, "You don't have permission to access this job")
         
         if status == "complete" and result_info:
             # Map the result back to LogoGenerationResponse
@@ -171,13 +183,18 @@ async def get_job_status(job_id: str, redis=Depends(get_redis)):
 @router.get("/history")
 async def get_generation_history(
     limit: int = 20,
-    db = Depends(get_db)
+    db = Depends(get_db),
+    user: dict = Depends(validate_clerk_token),
 ):
-    """Retrieve the latest logo generation history."""
+    """Retrieve the latest logo generation history (requires authentication)."""
+    user_id = user.get("sub", "anonymous")
+    print(f"[API] History request from user: {user_id}")
+    
     if not db:
         return []
         
     try:
+        # Optionally filter by user_id if available
         stmt = select(LogoGeneration).order_by(desc(LogoGeneration.created_at)).limit(limit)
         result = await db.execute(stmt)
         history = result.scalars().all()
@@ -187,11 +204,61 @@ async def get_generation_history(
         return []
 
 @router.websocket("/ws/progress/{job_id}")
-async def ws_progress(websocket: WebSocket, job_id: str):
-    """WebSocket endpoint to push real-time progress for a job."""
-    await websocket.accept()
+async def ws_progress(
+    websocket: WebSocket, 
+    job_id: str,
+    token: str = None  # Token can be passed as query param
+):
+    """WebSocket endpoint to push real-time progress for a job (requires authentication)."""
     from arq.jobs import Job
     import asyncio
+    from urllib.parse import unquote
+    
+    # Extract token from query params if not provided
+    if not token and "token" in websocket.query_params:
+        token = unquote(websocket.query_params["token"])
+    
+    # Validate token before accepting connection
+    try:
+        if not token:
+            await websocket.close(code=1008, reason="Missing authentication token")
+            return
+            
+        # Validate the token (you may need to adjust this based on your auth setup)
+        from dependencies import ClerkAuthProvider
+        from jose import jwt
+        
+        # For dev/demo: check if it's a dev token
+        dev_token = os.getenv("DEV_TOKEN")
+        if dev_token and token == dev_token:
+            print("[WS] ✅ Authorized via DEV_TOKEN")
+            # Token is valid, continue
+        else:
+            # Try to validate as Clerk JWT
+            jwks = await ClerkAuthProvider.get_jwks()
+            if jwks:
+                try:
+                    payload = jwt.decode(
+                        token, 
+                        jwks, 
+                        algorithms=["RS256"],
+                        options={"verify_aud": False}
+                    )
+                    print(f"[WS] ✅ Authorized user: {payload.get('sub')}")
+                except Exception as e:
+                    print(f"[WS] ❌ Token validation failed: {e}")
+                    await websocket.close(code=1008, reason="Invalid authentication token")
+                    return
+            else:
+                # If JWKS not configured, warn but allow (dev mode)
+                print("[WS] ⚠ Skipping token validation - JWKS not configured")
+    except Exception as e:
+        print(f"[WS] ❌ Auth check error: {e}")
+        await websocket.close(code=1011, reason="Authentication error")
+        return
+    
+    # Accept the connection
+    await websocket.accept()
     
     # Get redis pool from app state (created at startup)
     redis = websocket.app.state.redis
