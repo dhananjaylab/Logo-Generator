@@ -5,8 +5,6 @@ from fastapi import APIRouter, HTTPException, Depends, Request, WebSocket, WebSo
 from sqlalchemy import select, desc
 from google import genai
 from openai import AsyncOpenAI
-from arq import create_pool
-from arq.connections import RedisSettings
 
 from models import (
     LogoGenerationRequest, 
@@ -18,7 +16,7 @@ from models import (
 from services import LLMService
 from database import get_db, LogoGeneration
 from dependencies import get_gemini_client, get_openai_client, Clients, validate_clerk_token
-from config import LOGO_STYLES, COLOR_PALETTES, SUPPORTED_GENERATORS, REDIS_URL, REDIS_SETTINGS
+from config import LOGO_STYLES, COLOR_PALETTES, SUPPORTED_GENERATORS
 from limiter import limiter
 
 router = APIRouter(prefix="/api", tags=["logo"])
@@ -26,9 +24,9 @@ router = APIRouter(prefix="/api", tags=["logo"])
 _ROUTE_TIMEOUT = 90   # hard ceiling for the entire /generate request (s)
 
 
-async def get_redis():
-    """Dependency to get ARQ redis pool"""
-    return await create_pool(REDIS_SETTINGS)
+async def get_redis(request: Request):
+    """Dependency to get ARQ redis pool from app state (created at startup)"""
+    return request.app.state.redis
 
 
 @router.get("/health", response_model=HealthResponse)
@@ -189,12 +187,14 @@ async def get_generation_history(
         return []
 
 @router.websocket("/ws/progress/{job_id}")
-async def ws_progress(websocket: WebSocket, job_id: str, redis=Depends(get_redis)):
+async def ws_progress(websocket: WebSocket, job_id: str):
     """WebSocket endpoint to push real-time progress for a job."""
     await websocket.accept()
     from arq.jobs import Job
     import asyncio
     
+    # Get redis pool from app state (created at startup)
+    redis = websocket.app.state.redis
     queues = ["dalle_queue", "gemini_queue", "arq:queue"]
     
     try:
@@ -253,4 +253,4 @@ async def ws_progress(websocket: WebSocket, job_id: str, redis=Depends(get_redis
         try:
             await websocket.close()
         except:
-            pass
+            pass

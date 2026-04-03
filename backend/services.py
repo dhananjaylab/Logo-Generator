@@ -25,8 +25,10 @@ Fixes in this version
 """
 
 import io
+import os
 import asyncio
 import time
+import tempfile
 from typing import Tuple
 
 import requests as _requests      # synchronous – used in to_thread for DALL-E download
@@ -196,7 +198,7 @@ def build_logo_prompt(
 _GEMINI_MODEL_TIMEOUT = 45
 
 _GEMINI_IMAGE_MODELS = [
-   "gemini-2.5-flash-image",  # Latest and best for logos if available
+    "gemini-2.5-flash-image",     # if your API key has access
 ]
 
 
@@ -324,17 +326,20 @@ class DALLEService:
 
         image_url = response.data[0].url
 
-        # Synchronous download
+        # Download and validate image (via _download_image helper) and generate unique filename
+        fname = _unique_filename(brand, "dalle", variation_index)
+        tmp_dir = tempfile.gettempdir()  # Platform-aware temp directory (Windows: %TEMP%, Linux: /tmp)
+        tmp_path = os.path.join(tmp_dir, fname)
         try:
-            resp = await asyncio.to_thread(_requests.get, image_url, timeout=_DALLE_DL_TIMEOUT)
-            resp.raise_for_status()
-            image_data = resp.content
+            await asyncio.to_thread(_download_image, image_url, tmp_path)
+            with open(tmp_path, "rb") as f:
+                image_data = f.read()
+            os.unlink(tmp_path)
         except Exception as exc:
-            print(f"[DALL-E] ⚠ Download failed ({exc}); returning raw URL")
+            print(f"[DALL-E] ⚠ Download/validation failed ({exc}); returning raw URL")
             return image_url
 
         # Upload to R2
-        fname = _unique_filename(brand, "dalle", variation_index)
         try:
             url = await asyncio.to_thread(upload_to_r2, image_data, f"dalle/{fname}")
             print(f"[DALL-E] ✓ uploaded → {url}")
@@ -398,7 +403,8 @@ class LLMService:
 
     async def generate_logo_with_gemini(self, user_ip: str = None, **kwargs) -> Tuple[str, str]:
         user_id = kwargs.pop("user_id", None)
-        url, prompt = await self.gemini.generate_logo(**kwargs)
+        variation_index = kwargs.pop("variation_index", 0)
+        url, prompt = await self.gemini.generate_logo(**kwargs, variation_index=variation_index)
         
         # Save to DB
         await self._save_to_db(kwargs.get("text", "logo"), prompt, "gemini", url, user_ip)

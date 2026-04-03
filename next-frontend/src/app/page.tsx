@@ -1,10 +1,11 @@
 'use client';
 
-import React, { useState, useEffect, useRef } from 'react';
+import React, { useState, useEffect, useRef, useMemo } from 'react';
 import { Sparkles, Type, Cpu, Layers, Palette, Image as ImageIcon, Download, RefreshCw, ChevronDown, Target, Quote, CheckCircle2, Ban, Briefcase } from 'lucide-react';
 import styles from './page.module.css';
 import HistoryGallery from '../components/HistoryGallery';
 import IdentityPreview from '../components/IdentityPreview';
+import { resolveImageUrl } from '../lib/imageUrl';
 
 // Config
 const API_URL = 'http://localhost:8000';
@@ -22,7 +23,9 @@ export default function LogoForge() {
   const [progressValue, setProgressValue] = useState(0);
   const [logoSrc, setLogoSrc] = useState<string | null>(null);
   const [variationIndex, setVariationIndex] = useState(0);
-  const [token, setToken] = useState('logo-forge-dev-2026'); // Auth dummy
+  
+  // Stabilize token reference to prevent HistoryGallery re-fetches
+  const token = useMemo(() => 'logo-forge-dev-2026', []);
 
   const [advOpen, setAdvOpen] = useState(false);
   const [tagline, setTagline] = useState('');
@@ -33,6 +36,14 @@ export default function LogoForge() {
 
   const wsRef = useRef<WebSocket | null>(null);
   const progressSimRef = useRef<NodeJS.Timeout | null>(null);
+
+  // Cleanup WebSocket and intervals on component unmount
+  useEffect(() => {
+    return () => {
+      wsRef.current?.close();
+      if (progressSimRef.current) clearInterval(progressSimRef.current);
+    };
+  }, []);
 
   // Fallback Progress Simulator (since WebSockets only send "in_progress", we interpolate)
   const simulateProgress = (startVal: number, duration: number) => {
@@ -46,6 +57,30 @@ export default function LogoForge() {
       if (current >= 95) current = 95;
       setProgressValue(current);
     }, delay);
+  };
+
+  // Helper: process job result (from WebSocket or polling)
+  const handleJobResult = (result: any, isError: boolean = false) => {
+    if (progressSimRef.current) clearInterval(progressSimRef.current);
+    if (isError) {
+      alert(`Error: ${result.error || result}`);
+      setGenerating(false);
+      return;
+    }
+    
+    setProgressValue(100);
+    setProgressLabel('Complete');
+    
+    if (result && result.result) {
+      let imgUrl = typeof result.result === 'string' 
+        ? result.result 
+        : (Array.isArray(result.result) ? result.result[0] : result.result.image_url);
+      
+      if (imgUrl) {
+        setLogoSrc(resolveImageUrl(imgUrl));
+      }
+    }
+    setTimeout(() => setGenerating(false), 500);
   };
 
   const handleGenerate = async (isRegen = false) => {
@@ -91,35 +126,43 @@ export default function LogoForge() {
         if (msg.status === 'in_progress') {
           setProgressLabel('Generating image...');
         } else if (msg.status === 'completed') {
-          if (progressSimRef.current) clearInterval(progressSimRef.current);
-          setProgressValue(100);
-          setProgressLabel('Complete');
-          
-          if (msg.result && msg.result.result) {
-            let imgUrl = typeof msg.result.result === 'string' 
-              ? msg.result.result 
-              : (Array.isArray(msg.result.result) ? msg.result.result[0] : msg.result.result.image_url);
-            
-            if (imgUrl) {
-              imgUrl = imgUrl.replace(/\\/g, '/');
-              if (!imgUrl.startsWith('http')) {
-                 imgUrl = `${API_URL}/static/${imgUrl}`;
-              }
-              setLogoSrc(imgUrl);
-            }
-          }
-          setTimeout(() => setGenerating(false), 500);
+          handleJobResult(msg.result);
           ws.close();
         } else if (msg.status === 'failed') {
-          if (progressSimRef.current) clearInterval(progressSimRef.current);
-          alert(`Error: ${msg.error}`);
-          setGenerating(false);
+          handleJobResult(msg, true);
           ws.close();
         }
       };
 
-      ws.onerror = () => {
-        console.error("WebSocket error");
+      ws.onerror = async () => {
+        console.error("WebSocket error, falling back to polling");
+        // Fall back to REST polling via /api/jobs/{jobId}
+        let pollAttempts = 0;
+        const maxAttempts = 150; // ~5 minutes with 2s interval
+        const poll = setInterval(async () => {
+          pollAttempts++;
+          try {
+            const pollRes = await fetch(`${API_URL}/api/jobs/${jobId}`, {
+              headers: { 'Authorization': `Bearer ${token}` }
+            });
+            if (!pollRes.ok) throw new Error("Poll failed");
+            
+            const jobData = await pollRes.json();
+            if (jobData.status === 'completed') {
+              clearInterval(poll);
+              handleJobResult(jobData.result);
+            } else if (jobData.status === 'failed') {
+              clearInterval(poll);
+              handleJobResult(jobData, true);
+            }
+          } catch (pollErr) {
+            console.error("Polling error:", pollErr);
+            if (pollAttempts >= maxAttempts) {
+              clearInterval(poll);
+              handleJobResult("Polling timeout", true);
+            }
+          }
+        }, 2000);
       };
 
     } catch (err: any) {

@@ -76,12 +76,12 @@ venv\Scripts\activate  # Windows
 # 2. Install dependencies
 pip install -r requirements.txt
 
-# 3. Start workers (Separate terminals)
+# 3. Start FastAPI server (in one terminal)
+uvicorn app:app --reload --port 8000
+
+# 4. Start workers (in separate terminals)
 arq dalle_worker.WorkerSettings
 arq gemini_worker.WorkerSettings
-
-# 4. Start FastAPI server
-python app.py
 ```
 *API runs on: http://localhost:8000*
 

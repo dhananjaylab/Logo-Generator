@@ -15,15 +15,27 @@ load_dotenv()
 from routers import router as logo_router
 from database import init_db
 from limiter import limiter
+from arq import create_pool
+from config import REDIS_SETTINGS
 
 # (Limiter initialized in limiter.py)
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Lifecycle events for the FastAPI application."""
-    # Startup: Initialize database
+    # Startup: Initialize database and create redis pool
     await init_db()
+    
+    # Create and store redis connection pool at startup (avoid per-request creation)
+    app.state.redis = await create_pool(REDIS_SETTINGS)
+    print("[ARQ] ✓ Redis pool created at startup")
+    
     yield
+    
+    # Shutdown: Close redis pool
+    if hasattr(app.state, 'redis'):
+        await app.state.redis.close()
+        print("[ARQ] ✓ Redis pool closed at shutdown")
 
 app = FastAPI(
     title="Logo Generator API",
@@ -39,7 +51,10 @@ app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=[
+        "http://localhost:3000",
+        os.getenv("FRONTEND_URL", ""),
+    ],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
