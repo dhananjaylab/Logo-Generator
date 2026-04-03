@@ -5,10 +5,9 @@ import { Sparkles, Type, Cpu, Layers, Palette, Image as ImageIcon, Download, Ref
 import styles from './page.module.css';
 import HistoryGallery from '../components/HistoryGallery';
 import IdentityPreview from '../components/IdentityPreview';
-
-// Config
-const API_URL = 'http://localhost:8000';
-const WS_URL = 'ws://localhost:8000';
+import { resolveImageUrl } from '../lib/imageUrl';
+import { getAuthToken, getApiUrl, getWsUrl, authenticatedFetch } from '../lib/auth';
+import type { LogoGenerationResponse, JobStatusResponse } from '../lib/types';
 
 export default function LogoForge() {
   const [generator, setGenerator] = useState('dalle-3');
@@ -22,7 +21,10 @@ export default function LogoForge() {
   const [progressValue, setProgressValue] = useState(0);
   const [logoSrc, setLogoSrc] = useState<string | null>(null);
   const [variationIndex, setVariationIndex] = useState(0);
-  const [token, setToken] = useState('logo-forge-dev-2026'); // Auth dummy
+  
+  // Authentication token - fetched from Clerk or env
+  const [token, setToken] = useState<string | null>(null);
+  const [authLoading, setAuthLoading] = useState(true);
 
   const [advOpen, setAdvOpen] = useState(false);
   const [tagline, setTagline] = useState('');
@@ -33,6 +35,29 @@ export default function LogoForge() {
 
   const wsRef = useRef<WebSocket | null>(null);
   const progressSimRef = useRef<NodeJS.Timeout | null>(null);
+
+  // Initialize auth token on mount
+  useEffect(() => {
+    const initAuth = async () => {
+      try {
+        const authToken = await getAuthToken();
+        setToken(authToken);
+      } catch (err) {
+        console.error("[Auth] Failed to initialize token:", err);
+      } finally {
+        setAuthLoading(false);
+      }
+    };
+    initAuth();
+  }, []);
+
+  // Cleanup WebSocket and intervals on component unmount
+  useEffect(() => {
+    return () => {
+      wsRef.current?.close();
+      if (progressSimRef.current) clearInterval(progressSimRef.current);
+    };
+  }, []);
 
   // Fallback Progress Simulator (since WebSockets only send "in_progress", we interpolate)
   const simulateProgress = (startVal: number, duration: number) => {
@@ -48,8 +73,37 @@ export default function LogoForge() {
     }, delay);
   };
 
+  // Helper: process job result (from WebSocket or polling)
+  const handleJobResult = (result: LogoGenerationResponse | null, isError: boolean = false) => {
+    if (progressSimRef.current) clearInterval(progressSimRef.current);
+    if (isError) {
+      alert(`Error: ${(result as any)?.error || result}`);
+      setGenerating(false);
+      return;
+    }
+    
+    setProgressValue(100);
+    setProgressLabel('Complete');
+    
+    if (result && result.result) {
+      // Handle both string and array result shapes
+      let imgUrl: string | undefined;
+      if (typeof result.result === 'string') {
+        imgUrl = result.result;
+      } else if (Array.isArray(result.result) && result.result.length > 0) {
+        imgUrl = result.result[0];
+      }
+      
+      if (imgUrl) {
+        setLogoSrc(resolveImageUrl(imgUrl));
+      }
+    }
+    setTimeout(() => setGenerating(false), 500);
+  };
+
   const handleGenerate = async (isRegen = false) => {
     if (!brandName && !description) return alert("Provide brand name or description");
+    if (!token) return alert("Authentication required. Please reload the page.");
     
     let newVariation = variationIndex;
     if (isRegen) {
@@ -66,16 +120,22 @@ export default function LogoForge() {
     simulateProgress(5, generator === 'dalle-3' ? 12000 : 8000);
     setLogoSrc(null);
 
+    const API_URL = getApiUrl();
+    const WS_URL = getWsUrl();
+
     try {
       // 1. HTTP Post to Enqueue Job
-      const res = await fetch(`${API_URL}/api/generate`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${token}` },
-        body: JSON.stringify({
-          generator, style, palette, text: brandName, description, variation_index: newVariation,
-          tagline, typography, elements_to_include: elemInclude, elements_to_avoid: elemAvoid, brand_mission: mission
-        })
-      });
+      const res = await authenticatedFetch(
+        `${API_URL}/api/generate`,
+        {
+          method: 'POST',
+          body: JSON.stringify({
+            generator, style, palette, text: brandName, description, variation_index: newVariation,
+            tagline, typography, elements_to_include: elemInclude, elements_to_avoid: elemAvoid, brand_mission: mission
+          })
+        },
+        token
+      );
       
       const data = await res.json();
       if (!res.ok) throw new Error(data.detail || "Generation Failed");
@@ -83,7 +143,7 @@ export default function LogoForge() {
       const jobId = data.job_id;
       
       // 2. Connect WebSocket to listen for progress
-      const ws = new WebSocket(`${WS_URL}/api/ws/progress/${jobId}`);
+      const ws = new WebSocket(`${WS_URL}/api/ws/progress/${jobId}?token=${encodeURIComponent(token)}`);
       wsRef.current = ws;
 
       ws.onmessage = (event) => {
@@ -91,35 +151,45 @@ export default function LogoForge() {
         if (msg.status === 'in_progress') {
           setProgressLabel('Generating image...');
         } else if (msg.status === 'completed') {
-          if (progressSimRef.current) clearInterval(progressSimRef.current);
-          setProgressValue(100);
-          setProgressLabel('Complete');
-          
-          if (msg.result && msg.result.result) {
-            let imgUrl = typeof msg.result.result === 'string' 
-              ? msg.result.result 
-              : (Array.isArray(msg.result.result) ? msg.result.result[0] : msg.result.result.image_url);
-            
-            if (imgUrl) {
-              imgUrl = imgUrl.replace(/\\/g, '/');
-              if (!imgUrl.startsWith('http')) {
-                 imgUrl = `${API_URL}/static/${imgUrl}`;
-              }
-              setLogoSrc(imgUrl);
-            }
-          }
-          setTimeout(() => setGenerating(false), 500);
+          handleJobResult(msg.result);
           ws.close();
         } else if (msg.status === 'failed') {
-          if (progressSimRef.current) clearInterval(progressSimRef.current);
-          alert(`Error: ${msg.error}`);
-          setGenerating(false);
+          handleJobResult(msg, true);
           ws.close();
         }
       };
 
-      ws.onerror = () => {
-        console.error("WebSocket error");
+      ws.onerror = async () => {
+        console.error("WebSocket error, falling back to polling");
+        // Fall back to REST polling via /api/jobs/{jobId}
+        let pollAttempts = 0;
+        const maxAttempts = 150; // ~5 minutes with 2s interval
+        const poll = setInterval(async () => {
+          pollAttempts++;
+          try {
+            const pollRes = await authenticatedFetch(
+              `${API_URL}/api/jobs/${jobId}`,
+              {},
+              token
+            );
+            if (!pollRes.ok) throw new Error("Poll failed");
+            
+            const jobData: JobStatusResponse = await pollRes.json();
+            if (jobData.status === 'completed' && jobData.result) {
+              clearInterval(poll);
+              handleJobResult(jobData.result);
+            } else if (jobData.status === 'failed') {
+              clearInterval(poll);
+              handleJobResult(jobData, true);
+            }
+          } catch (pollErr) {
+            console.error("Polling error:", pollErr);
+            if (pollAttempts >= maxAttempts) {
+              clearInterval(poll);
+              handleJobResult(null, true);
+            }
+          }
+        }, 2000);
       };
 
     } catch (err: any) {

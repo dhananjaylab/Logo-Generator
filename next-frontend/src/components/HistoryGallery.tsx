@@ -3,54 +3,59 @@
 import React, { useEffect, useState, useCallback } from 'react';
 import { RefreshCw, ChevronDown } from 'lucide-react';
 import styles from '../app/page.module.css';
+import { resolveImageUrl } from '../lib/imageUrl';
+import { getApiUrl, authenticatedFetch } from '../lib/auth';
+import type { HistoryEntry } from '../lib/types';
 
-const API_URL = 'http://localhost:8000';
-
-interface HistoryItem {
-  id: number;
-  brand_name: string;
-  image_url: string;
-  generator: string;
-  created_at: string;
-}
+interface HistoryItem extends HistoryEntry {}
 
 export default function HistoryGallery({ 
   onSelect, token 
 }: { 
   onSelect: (brand: string, logoSrc: string) => void,
-  token: string 
+  token: string | null
 }) {
   const [history, setHistory] = useState<HistoryItem[]>([]);
   const [loading, setLoading] = useState(true);
   const [open, setOpen] = useState(true);
 
   const fetchHistory = useCallback(async () => {
+    if (!token) {
+      console.log("[HistoryGallery] Waiting for authentication token");
+      return;
+    }
+
     try {
       setLoading(true);
-      const res = await fetch(`${API_URL}/api/history?limit=12`, {
-        headers: { 'Authorization': `Bearer ${token}` }
-      });
-      if (!res.ok) throw new Error("Failed to fetch history");
+      const API_URL = getApiUrl();
+      const url = `${API_URL}/api/history?limit=12`;
+      console.log("[HistoryGallery] Fetching from:", url);
+      
+      const res = await authenticatedFetch(url, {}, token);
+      
+      console.log("[HistoryGallery] Response status:", res.status);
+      
+      if (!res.ok) {
+        const errorText = await res.text();
+        throw new Error(`HTTP ${res.status}: ${errorText}`);
+      }
+      
       const data = await res.json();
       setHistory(data);
+      console.log("[HistoryGallery] Loaded", data.length, "items");
     } catch (err) {
-      console.error(err);
+      console.error("[HistoryGallery] Fetch failed:", err);
     } finally {
       setLoading(false);
     }
-  }, [token]);
+  }, [token]); // Token must be stable in parent to avoid re-fetch loops
 
   useEffect(() => {
     fetchHistory();
   }, [fetchHistory]);
 
   const handleSelect = (item: HistoryItem) => {
-    let src = item.image_url;
-    src = src.replace(/\\/g, '/');
-    if (!src.startsWith('http')) {
-      src = `${API_URL}/static/${src}`;
-    }
-    onSelect(item.brand_name, src);
+    onSelect(item.brand_name, resolveImageUrl(item.image_url));
   };
 
   return (
@@ -72,8 +77,7 @@ export default function HistoryGallery({
             <div className={styles.galleryLoading}>No history found yet.</div>
           )}
           {!loading && history.map(item => {
-            let src = item.image_url.replace(/\\/g, '/');
-            if (!src.startsWith('http')) src = `${API_URL}/static/${src}`;
+            const src = resolveImageUrl(item.image_url);
             
             return (
                <div key={item.id} className={styles.galleryItem} onClick={() => handleSelect(item)}>

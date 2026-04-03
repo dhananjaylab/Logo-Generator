@@ -12,11 +12,16 @@ R2_PUBLIC_DOMAIN = os.getenv("R2_PUBLIC_DOMAIN", "").rstrip("/")
 DATABASE_URL = os.getenv("DATABASE_URL")
 REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379")
 
-# Redis / ARQ Settings (Increase timeouts for remote cloud instances)
+# Redis / ARQ Settings
 from arq.connections import RedisSettings
-REDIS_SETTINGS = RedisSettings.from_dsn(REDIS_URL)
-REDIS_SETTINGS.conn_timeout = 20
-REDIS_SETTINGS.socket_timeout = 20
+_temp_settings = RedisSettings.from_dsn(REDIS_URL)
+REDIS_SETTINGS = RedisSettings(
+    host=_temp_settings.host,
+    port=_temp_settings.port,
+    database=_temp_settings.database,
+    password=_temp_settings.password,
+    conn_timeout=20,
+)
 
 # Design Constants and Configuration
 
