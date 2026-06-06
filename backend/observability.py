@@ -5,6 +5,7 @@ Tracks queue depth, generation latency, R2 uploads, and error rates.
 
 import time
 import logging
+from contextvars import ContextVar
 from datetime import datetime, timedelta
 from collections import defaultdict
 from typing import Dict, Optional
@@ -12,6 +13,10 @@ from dataclasses import dataclass, field
 from enum import Enum
 
 logger = logging.getLogger(__name__)
+
+# Stores the current request ID for the duration of each async request.
+# Set by metrics_middleware; read by RequestIDFilter in logging_config.py.
+request_id_ctx: ContextVar[str] = ContextVar("request_id", default="N/A")
 
 
 class MetricType(str, Enum):
@@ -199,6 +204,7 @@ async def metrics_middleware(request, call_next):
     # Get or create request ID
     request_id = request.headers.get("x-request-id", f"req_{id(request)}")
     request.state.request_id = request_id
+    request_id_ctx.set(request_id)   # ← inject into logging context
     
     try:
         response = await call_next(request)
