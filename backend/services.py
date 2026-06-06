@@ -71,13 +71,15 @@ def get_r2_client():
 
 def upload_to_r2(data: bytes, filename: str, content_type: str = "image/png") -> str:
     """
-    Upload bytes to R2 and return the public URL or S3-compatible path.
+    Upload bytes to R2. Raises RuntimeError on any failure so the caller
+    (worker task) can mark the job as failed and surface a real error.
     """
     client = get_r2_client()
     if not client or not R2_BUCKET_NAME:
-        print("[R2] ⚠ R2 client or bucket not configured; falling back to local simulation")
-        return f"LOCAL_FALLBACK/{filename}"
-
+        raise RuntimeError(
+            "R2 upload failed: storage client not configured. "
+            "Set R2_ACCESS_KEY_ID, R2_SECRET_ACCESS_KEY, R2_ENDPOINT_URL, R2_BUCKET_NAME."
+        )
     try:
         client.put_object(
             Bucket=R2_BUCKET_NAME,
@@ -85,13 +87,11 @@ def upload_to_r2(data: bytes, filename: str, content_type: str = "image/png") ->
             Body=data,
             ContentType=content_type,
         )
-        # Construct the URL. Use public domain if available, else endpoint+bucket
         if R2_PUBLIC_DOMAIN:
             return f"{R2_PUBLIC_DOMAIN}/{filename}"
         return f"{R2_ENDPOINT_URL}/{R2_BUCKET_NAME}/{filename}"
     except Exception as exc:
-        print(f"[R2] ⚠ Upload failed: {exc}")
-        return f"UPLOAD_FAILED/{filename}"
+        raise RuntimeError(f"R2 upload failed for '{filename}': {exc}") from exc
 
 
 # ─────────────────────────────────────────────────────────────────────────────
