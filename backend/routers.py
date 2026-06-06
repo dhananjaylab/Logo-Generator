@@ -215,161 +215,107 @@ async def get_generation_history(
         return []
 
 @router.websocket("/ws/progress/{job_id}")
-async def ws_progress(
-    websocket: WebSocket, 
-    job_id: str,
-    token: str = None  # Token can be passed as query param
-):
+async def ws_progress(websocket: WebSocket, job_id: str):
     """
-    WebSocket endpoint to push real-time progress for a job.
-    Requires authentication. Falls back to HTTP polling if WebSocket fails.
-    Implements exponential backoff to reduce chattiness under load.
+    WebSocket endpoint. Uses Redis Pub/Sub push instead of polling.
+    Scales to thousands of concurrent connections.
+    Token passed as query param: ?token=<value>
     """
     from arq.jobs import Job
-    import asyncio
     from urllib.parse import unquote
-    
-    # Extract token from query params if not provided
-    if not token and "token" in websocket.query_params:
-        token = unquote(websocket.query_params["token"])
-    
-    # Validate token before accepting connection
-    user_id = None
-    is_production = os.getenv("ENV") == "production"
-    dev_token = os.getenv("DEV_TOKEN")
-    
+    from dependencies import validate_token_string
+    import json
+
+    # ── Auth ───────────────────────────────────────────────────────────────
+    raw_token = websocket.query_params.get("token")
+    if raw_token:
+        raw_token = unquote(raw_token)
     try:
-        if not token:
-            await websocket.close(code=1008, reason="Missing authentication token")
-            return
-        
-        from dependencies import ClerkAuthProvider
-        from jose import jwt
-        
-        # Check dev token first (only in non-prod)
-        if dev_token and token == dev_token:
-            if is_production:
-                await websocket.close(code=1008, reason="Dev tokens not allowed in production")
-                return
-            print("[WS] ✅ Authorized via DEV_TOKEN")
-            user_id = "developer"
-        else:
-            # Validate as Clerk JWT
-            jwks = await ClerkAuthProvider.get_jwks()
-            if jwks:
-                try:
-                    audience = os.getenv("CLERK_AUDIENCE", os.getenv("NEXT_PUBLIC_API_URL", "http://localhost:3000"))
-                    payload = jwt.decode(
-                        token, 
-                        jwks, 
-                        algorithms=["RS256"],
-                        audience=audience if is_production else None,
-                        options={"verify_aud": is_production}
-                    )
-                    user_id = payload.get("sub")
-                    print(f"[WS] ✅ Authorized user: {user_id}")
-                except Exception as e:
-                    print(f"[WS] ❌ Token validation failed: {e}")
-                    await websocket.close(code=1008, reason="Invalid authentication token")
-                    return
-            else:
-                if is_production:
-                    await websocket.close(code=1011, reason="Authentication service unavailable")
-                    return
-                # In dev, allow if JWKS not configured
-                print("[WS] ⚠ Skipping token validation - JWKS not configured")
-                user_id = "anonymous"
-    except Exception as e:
-        print(f"[WS] ❌ Auth check error: {e}")
-        await websocket.close(code=1011, reason="Authentication error")
+        user = await validate_token_string(raw_token)
+        user_id = user.get("sub", "anonymous")
+    except HTTPException as exc:
+        await websocket.close(code=1008, reason=exc.detail)
         return
-    
-    # Accept the connection
+
     await websocket.accept()
-    
-    # Get redis pool from app state
     redis = websocket.app.state.redis
-    queues = ["dalle_queue", "gemini_queue", "arq:queue"]
-    
-    # Exponential backoff for polling (1s -> 2s -> 4s max)
-    min_poll_interval = 0.5
-    max_poll_interval = 4.0
-    current_poll_interval = min_poll_interval
-    
+    channel = f"job:complete:{job_id}"
+    pubsub = None
+
     try:
-        consecutive_not_found = 0
-        while True:
-            status = "not_found"
-            job_instance = None
-            
-            for q in queues:
-                temp_job = Job(job_id, redis, _queue_name=q)
-                temp_status = await temp_job.status()
-                temp_status_str = temp_status.value if hasattr(temp_status, "value") else str(temp_status)
-                if temp_status_str != "not_found":
-                    status = temp_status_str
-                    job_instance = temp_job
-                    consecutive_not_found = 0  # Reset backoff
-                    break
-            
-            if not job_instance or status == "not_found":
-                consecutive_not_found += 1
-                # Exponential backoff: increase poll interval
-                current_poll_interval = min(
-                    max_poll_interval,
-                    min_poll_interval * (2 ** (consecutive_not_found - 1))
-                )
-                await websocket.send_json({"status": "queued"})
-                await asyncio.sleep(current_poll_interval)
-                continue
-                
-            if status == "complete":
-                info = await job_instance.result_info()
-                
-                # Job ownership check: verify user_id matches
-                job_user_id = info.kwargs.get("user_id") if info else None
-                if job_user_id and job_user_id != user_id and user_id != "developer":
-                    print(f"[WS] ❌ Job ownership check failed: {job_user_id} != {user_id}")
+        # Subscribe FIRST — before checking job status — to eliminate the
+        # race condition where the job completes between our check and subscribe.
+        pubsub = redis.pubsub()
+        await pubsub.subscribe(channel)
+
+        # Check if job already completed while we were subscribing.
+        queues = ["dalle_queue", "gemini_queue", "arq:queue"]
+        for q in queues:
+            job_obj = Job(job_id, redis, _queue_name=q)
+            status = await job_obj.status()
+            status_str = status.value if hasattr(status, "value") else str(status)
+            if status_str == "complete":
+                info = await job_obj.result_info()
+                job_owner = info.kwargs.get("user_id") if info else None
+                if job_owner and job_owner != user_id and user_id != "developer":
                     await websocket.send_json({"status": "failed", "error": "Unauthorized"})
-                    break
-                
+                    return
                 if info and info.result:
-                    res_data = info.result
-                    if res_data.get("status") == "failed":
-                        await websocket.send_json({"status": "failed", "error": res_data.get("error")})
+                    res = info.result
+                    if res.get("status") == "failed":
+                        await websocket.send_json({"status": "failed", "error": res.get("error")})
                     else:
                         await websocket.send_json({
                             "status": "completed",
                             "result": {
-                                "result": res_data.get("result"),
-                                "generator": res_data.get("generator"),
-                                "prompt": res_data.get("prompt"),
+                                "result": res.get("result"),
+                                "generator": res.get("generator"),
+                                "prompt": res.get("prompt"),
                                 "brand": info.kwargs.get("text"),
                                 "style": info.kwargs.get("style"),
                                 "palette": info.kwargs.get("palette"),
                             }
                         })
-                else:
-                    await websocket.send_json({"status": "completed"})
-                break
-                
-            elif status == "in_progress":
-                await websocket.send_json({"status": "in_progress"})
-                current_poll_interval = min_poll_interval  # Reset during active processing
-                await asyncio.sleep(current_poll_interval)
-            else:
-                await websocket.send_json({"status": status})
-                await asyncio.sleep(current_poll_interval)
-                
+                return  # done — already had the result
+
+        # Job is still pending — tell the client and wait for the pub/sub push.
+        await websocket.send_json({"status": "queued"})
+
+        try:
+            async with asyncio.timeout(300):  # 5-minute hard ceiling
+                async for message in pubsub.listen():
+                    if message["type"] != "message":
+                        continue
+                    data = json.loads(message["data"])
+
+                    # Ownership check on streamed result
+                    published_owner = data.pop("user_id", None)
+                    if published_owner and published_owner != user_id and user_id != "developer":
+                        await websocket.send_json({"status": "failed", "error": "Unauthorized"})
+                        break
+
+                    await websocket.send_json(data)
+                    break  # single-shot — one event per job
+
+        except asyncio.TimeoutError:
+            await websocket.send_json({"status": "failed", "error": "Job timed out waiting for result"})
+
     except WebSocketDisconnect:
-        print(f"[WS] Client disconnected for job {job_id}")
+        logger.info(f"[WS] Client disconnected for job {job_id}")
     except Exception as e:
-        print(f"[WS] Error: {e}")
+        logger.error(f"[WS] Unexpected error for job {job_id}: {e}")
         try:
             await websocket.send_json({"status": "error", "error": str(e)})
-        except:
+        except Exception:
             pass
+    finally:
+        if pubsub:
+            try:
+                await pubsub.unsubscribe(channel)
+                await pubsub.close()
+            except Exception:
+                pass
         try:
             await websocket.close()
-        except:
+        except Exception:
             pass
