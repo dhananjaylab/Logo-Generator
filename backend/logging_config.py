@@ -9,6 +9,7 @@ import logging.handlers
 import os
 import sys
 from pythonjsonlogger import jsonlogger
+from observability import request_id_ctx
 
 # Try to import Sentry, graceful fallback if not installed
 try:
@@ -41,12 +42,8 @@ if SENTRY_AVAILABLE:
 
 class RequestIDFilter(logging.Filter):
     """Add request_id to logging context if available"""
-    def __init__(self, request_id_var: str = "request_id"):
-        self.request_id_var = request_id_var
-        
     def filter(self, record):
-        # Try to get request_id from context (should be set by middleware)
-        record.request_id = getattr(record, "request_id", "N/A")
+        record.request_id = request_id_ctx.get()   # ← reads the async context
         return True
 
 
