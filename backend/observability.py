@@ -5,12 +5,15 @@ Tracks queue depth, generation latency, R2 uploads, and error rates.
 
 import time
 import logging
+import uuid
 from contextvars import ContextVar
 from datetime import datetime, timedelta
 from collections import defaultdict
 from typing import Dict, Optional
 from dataclasses import dataclass, field
 from enum import Enum
+
+from prom_metrics import http_requests_total, http_request_duration_seconds
 
 logger = logging.getLogger(__name__)
 
@@ -51,7 +54,7 @@ class MetricsCollector:
         
     def start_timer(self, name: str) -> str:
         """Start a named timer, return timer_id"""
-        timer_id = f"{name}_{id(self)}"
+        timer_id = f"{name}_{uuid.uuid4().hex}"
         self.timers[timer_id] = time.time()
         return timer_id
     
@@ -209,6 +212,17 @@ async def metrics_middleware(request, call_next):
     try:
         response = await call_next(request)
         duration = time.time() - start_time
+
+        http_requests_total.labels(
+            method=request.method,
+            path=request.url.path,
+            status=str(response.status_code),
+        ).inc()
+        http_request_duration_seconds.labels(
+            method=request.method,
+            path=request.url.path,
+            status=str(response.status_code),
+        ).observe(duration)
         
         # Record HTTP metrics
         metrics.record_metric(
@@ -236,6 +250,16 @@ async def metrics_middleware(request, call_next):
         return response
     except Exception as e:
         duration = time.time() - start_time
+        http_requests_total.labels(
+            method=request.method,
+            path=request.url.path,
+            status="error",
+        ).inc()
+        http_request_duration_seconds.labels(
+            method=request.method,
+            path=request.url.path,
+            status="error",
+        ).observe(duration)
         metrics.record_metric(
             "http_requests_total",
             1,

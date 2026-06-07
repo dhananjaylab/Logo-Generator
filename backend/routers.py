@@ -1,8 +1,11 @@
 import asyncio
+import json
 import os
+import logging
 from typing import List, Optional
 from fastapi import APIRouter, HTTPException, Depends, Request, WebSocket, WebSocketDisconnect
-from sqlalchemy import select, desc
+from fastapi.responses import JSONResponse
+from sqlalchemy import select, desc, text
 from google import genai
 from openai import AsyncOpenAI
 
@@ -18,8 +21,10 @@ from database import get_db, LogoGeneration
 from dependencies import get_gemini_client, get_openai_client, Clients, validate_clerk_token
 from config import LOGO_STYLES, COLOR_PALETTES, SUPPORTED_GENERATORS
 from limiter import limiter
+from prom_metrics import queue_depth, component_ready
 
-router = APIRouter(prefix="/api", tags=["logo"])
+router = APIRouter(prefix="/api/v1", tags=["logo"])
+logger = logging.getLogger(__name__)
 
 _ROUTE_TIMEOUT = 90   # hard ceiling for the entire /generate request (s)
 
@@ -30,12 +35,46 @@ async def get_redis(request: Request):
 
 
 @router.get("/health", response_model=HealthResponse)
-async def health_check():
-    return {
+async def health_check(
+    redis=Depends(get_redis),
+    db=Depends(get_db),
+):
+    health: dict = {
         "status": "ok",
         "gemini_ready": Clients.is_gemini_ready(),
         "openai_ready": Clients.is_openai_ready(),
+        "redis_ready": False,
+        "db_ready": False,
     }
+
+    if not health["gemini_ready"] or not health["openai_ready"]:
+        health["status"] = "degraded"
+
+    component_ready.labels(component="api").set(1)
+    component_ready.labels(component="gemini").set(1 if health["gemini_ready"] else 0)
+    component_ready.labels(component="openai").set(1 if health["openai_ready"] else 0)
+
+    try:
+        await redis.ping()
+        health["redis_ready"] = True
+        component_ready.labels(component="redis").set(1)
+    except Exception as exc:
+        health["status"] = "degraded"
+        component_ready.labels(component="redis").set(0)
+        logger.warning(f"[Health] Redis ping failed: {exc}")
+
+    if db:
+        try:
+            await db.execute(text("SELECT 1"))
+            health["db_ready"] = True
+            component_ready.labels(component="db").set(1)
+        except Exception as exc:
+            health["status"] = "degraded"
+            component_ready.labels(component="db").set(0)
+            logger.warning(f"[Health] DB probe failed: {exc}")
+
+    status_code = 200 if health["status"] == "ok" else 503
+    return JSONResponse(content=health, status_code=status_code)
 
 
 @router.post("/generate", response_model=LogoJobResponse)
@@ -100,6 +139,12 @@ async def generate_logo(
         _queue_name=queue_name,
         **common
     )
+
+    try:
+        depth = await redis.llen(queue_name)
+        queue_depth.labels(queue=queue_name).set(depth)
+    except Exception as exc:
+        logger.warning(f"[Queue] Failed to refresh depth for {queue_name}: {exc}")
 
     return {
         "job_id": job.job_id,
@@ -213,6 +258,26 @@ async def get_generation_history(
     except Exception as e:
         print(f"[DB] ⚠ Failed to fetch history: {e}")
         return []
+
+
+@router.get("/admin/dlq")
+async def inspect_dlq(
+    queue: str = "dalle",
+    limit: int = 20,
+    redis=Depends(get_redis),
+    user: dict = Depends(validate_clerk_token),
+):
+    """List permanently failed jobs from a dead-letter queue."""
+    _ = user
+    queue_name = queue if queue in {"dalle", "gemini"} else "dalle"
+    limit = max(1, min(limit, 100))
+    items = await redis.lrange(f"dlq:{queue_name}", 0, limit - 1)
+    decoded = []
+    for item in items:
+        if isinstance(item, bytes):
+            item = item.decode("utf-8")
+        decoded.append(json.loads(item))
+    return decoded
 
 @router.websocket("/ws/progress/{job_id}")
 async def ws_progress(websocket: WebSocket, job_id: str):
