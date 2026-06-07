@@ -7,7 +7,7 @@ LogoForge AI is a modern, high-performance web application designed to generate 
 ## ✨ Features
 
 - **Dual AI Generators**:
-  - **DALL-E 3**: High-fidelity, artistic excellence with GPT-4 prompt refinement.
+  - **GPT Image 2 (`gpt-image-2-2026-04-21`)**: High-fidelity logo generation with base64 image output.
   - **Gemini**: Lightning-fast iterations directly from Google's latest vision models.
 - **Structured Customization**:
   - **Icon vs. Lettermark Modes**: Control the focus of your design.
@@ -80,7 +80,7 @@ pip install -r requirements.txt
 uvicorn app:app --reload --port 8000
 
 # 4. Start workers (in separate terminals)
-arq dalle_worker.WorkerSettings
+arq openai_image_worker.WorkerSettings
 arq gemini_worker.WorkerSettings
 ```
 *API runs on: http://localhost:8000*
@@ -108,7 +108,7 @@ LogoForge AI uses a modular, facade-based architecture to manage multiple AI gen
 | :--- | :--- |
 | **`app.py`** | FastAPI entry point, lifespan management, and CORS configuration. |
 | **`routers.py`** | API route handlers for health checks and logo generation. |
-| **`services.py`** | The business logic layer, featuring the `LLMService` (Facade) which orchestrates `GeminiService` and `DALLEService`. |
+| **`services.py`** | The business logic layer, featuring the `LLMService` (Facade) which orchestrates `GeminiService` and `OpenAIImageService`. |
 | **`models.py`** | Pydantic models for request/response validation and type safety. |
 | **`dependencies.py`** | Managed singleton for API clients (OpenAI, Google GenAI). |
 | **`config.py`** | Centralized design tokens (styles, palettes) and prompt templates. |
@@ -129,11 +129,11 @@ graph TD
 
 ### 🧬 Generation Flows
 
-#### DALL-E 3 (Refined)
+#### GPT Image 2
 1.  **FastAPI** receives the request and validates via Pydantic.
-2.  **LLMService** calls `GeminiService.refine_prompt()` to turn raw user inputs into a professional design prompt.
-3.  **LLMService** calls `DALLEService.generate_logo()` with the refined prompt.
-4.  The binary image is uploaded to **Cloudflare R2**, and the URL is returned.
+2.  **LLMService** builds a logo-specific prompt with hard output constraints first.
+3.  **LLMService** calls `OpenAIImageService.generate_logo()` with `model="gpt-image-2-2026-04-21"`.
+4.  The base64 image payload is decoded, uploaded to **Cloudflare R2**, and the public URL is returned.
 
 #### Gemini (Direct)
 1.  **FastAPI** validates the request.
