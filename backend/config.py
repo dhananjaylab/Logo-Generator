@@ -43,10 +43,10 @@ COLOR_PALETTES = {
     'neon': 'Neon (Green, Magenta, Cyan)',
 }
 
-SUPPORTED_GENERATORS = ['dall-e-3', 'gemini']
+SUPPORTED_GENERATORS = ['gpt-image-2-2026-04-21', 'gemini']
 
 # Prompt engineering templates
-DALLE3_PROMPT_TEMPLATE = (
+GPT_IMAGE_PROMPT_TEMPLATE = (
     "You are a world-class logo designer and prompt engineer. "
     "Craft a detailed, high-quality image generation prompt for a brand named '{text}'.\n"
     "Context: {description}\n"
@@ -56,7 +56,7 @@ DALLE3_PROMPT_TEMPLATE = (
     "- Focus on professional, high-concept visual metaphors.\n"
     "- Ensure a clean white background.\n"
     "- Maintain a sharp, vector-ready aesthetic.\n"
-    "- The prompt should be optimized for DALL-E 3.\n"
+    "- The prompt should be optimized for GPT image generation.\n"
     "- DO NOT mention any text other than '{text}' if it fits the design.\n"
     "Return ONLY the optimized prompt text."
 )
