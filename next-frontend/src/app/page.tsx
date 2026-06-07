@@ -3,11 +3,11 @@
 import React, { useState, useEffect, useRef } from 'react';
 import { Sparkles, Type, Cpu, Layers, Palette, Image as ImageIcon, Download, RefreshCw, ChevronDown, Target, Quote, CheckCircle2, Ban, Briefcase } from 'lucide-react';
 import styles from './page.module.css';
-import HistoryGallery from '../components/HistoryGallery';
-import IdentityPreview from '../components/IdentityPreview';
-import { resolveImageUrl } from '../lib/imageUrl';
-import { getAuthToken, getApiUrl, getWsUrl, authenticatedFetch } from '../lib/auth';
-import type { LogoGenerationResponse, JobStatusResponse } from '../lib/types';
+import HistoryGallery from '@/components/HistoryGallery';
+import IdentityPreview from '@/components/IdentityPreview';
+import { resolveImageUrl } from '@/lib/imageUrl';
+import { getAuthToken, getApiUrl, getWsUrl, authenticatedFetch } from '@/lib/auth';
+import type { LogoGenerationResponse, JobStatusResponse } from '@/lib/types';
 
 export default function LogoForge() {
   const [generator, setGenerator] = useState('gpt-image-2-2026-04-21');
@@ -126,7 +126,7 @@ export default function LogoForge() {
     try {
       // 1. HTTP Post to Enqueue Job
       const res = await authenticatedFetch(
-        `${API_URL}/api/generate`,
+        `${API_URL}/generate`,
         {
           method: 'POST',
           body: JSON.stringify({
@@ -143,7 +143,7 @@ export default function LogoForge() {
       const jobId = data.job_id;
       
       // 2. Connect WebSocket to listen for progress
-      const ws = new WebSocket(`${WS_URL}/api/ws/progress/${jobId}?token=${encodeURIComponent(token)}`);
+      const ws = new WebSocket(`${WS_URL}/ws/progress/${jobId}?token=${encodeURIComponent(token)}`);
       wsRef.current = ws;
 
       ws.onmessage = (event) => {
@@ -161,14 +161,14 @@ export default function LogoForge() {
 
       ws.onerror = async () => {
         console.error("WebSocket error, falling back to polling");
-        // Fall back to REST polling via /api/jobs/{jobId}
+        // Fall back to REST polling via /jobs/{jobId}
         let pollAttempts = 0;
         const maxAttempts = 150; // ~5 minutes with 2s interval
         const poll = setInterval(async () => {
           pollAttempts++;
           try {
             const pollRes = await authenticatedFetch(
-              `${API_URL}/api/jobs/${jobId}`,
+              `${API_URL}/jobs/${jobId}`,
               {},
               token
             );

@@ -2,10 +2,10 @@
 
 import React, { useEffect, useState, useCallback } from 'react';
 import { RefreshCw, ChevronDown } from 'lucide-react';
-import styles from '../app/page.module.css';
-import { resolveImageUrl } from '../lib/imageUrl';
-import { getApiUrl, authenticatedFetch } from '../lib/auth';
-import type { HistoryEntry } from '../lib/types';
+import styles from '@/app/page.module.css';
+import { resolveImageUrl } from '@/lib/imageUrl';
+import { getApiUrl, authenticatedFetch } from '@/lib/auth';
+import type { HistoryEntry } from '@/lib/types';
 
 interface HistoryItem extends HistoryEntry {}
 
@@ -28,7 +28,7 @@ export default function HistoryGallery({
     try {
       setLoading(true);
       const API_URL = getApiUrl();
-      const url = `${API_URL}/api/history?limit=12`;
+      const url = `${API_URL}/history?limit=12`;
       console.log("[HistoryGallery] Fetching from:", url);
       
       const res = await authenticatedFetch(url, {}, token);

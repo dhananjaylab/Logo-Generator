@@ -44,7 +44,8 @@ export async function getAuthToken(): Promise<string> {
  * Get the API base URL
  */
 export function getApiUrl(): string {
-  return process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8000';
+  const base = (process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8000').replace(/\/$/, '');
+  return base.endsWith('/api/v1') ? base : `${base}/api/v1`;
 }
 
 /**

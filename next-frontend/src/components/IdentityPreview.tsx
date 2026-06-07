@@ -2,7 +2,7 @@
 
 import React from 'react';
 import { Mail, Globe, MapPin, CreditCard, Smartphone, Monitor } from 'lucide-react';
-import styles from '../app/page.module.css';
+import styles from '@/app/page.module.css';
 
 interface IdentityPreviewProps {
   readonly brandName: string;
