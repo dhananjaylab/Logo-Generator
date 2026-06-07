@@ -74,7 +74,7 @@ export default function LogoForge() {
   };
 
   // Helper: process job result (from WebSocket or polling)
-  const handleJobResult = (result: LogoGenerationResponse | null, isError: boolean = false) => {
+  const handleJobResult = (result: LogoGenerationResponse | JobStatusResponse | null, isError: boolean = false) => {
     if (progressSimRef.current) clearInterval(progressSimRef.current);
     if (isError) {
       alert(`Error: ${(result as any)?.error || result}`);
@@ -85,7 +85,7 @@ export default function LogoForge() {
     setProgressValue(100);
     setProgressLabel('Complete');
     
-    if (result && result.result) {
+    if (result && 'result' in result && result.result) {
       // Handle both string and array result shapes
       let imgUrl: string | undefined;
       if (typeof result.result === 'string') {

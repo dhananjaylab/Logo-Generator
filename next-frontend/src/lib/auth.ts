@@ -82,13 +82,11 @@ export async function authenticatedFetch(
     authToken = process.env.NEXT_PUBLIC_DEV_TOKEN || process.env.NEXT_PUBLIC_JWT_TOKEN;
   }
 
-  const headers: HeadersInit = {
-    'Content-Type': 'application/json',
-    ...(options?.headers || {}),
-  };
+  const headers = new Headers(options?.headers || {});
+  headers.set('Content-Type', 'application/json');
 
   if (authToken) {
-    headers['Authorization'] = `Bearer ${authToken}`;
+    headers.set('Authorization', `Bearer ${authToken}`);
   }
 
   return fetch(url, {
