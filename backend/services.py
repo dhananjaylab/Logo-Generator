@@ -132,16 +132,11 @@ def build_logo_prompt(
     later creative instructions.
     Style and palette come SECOND so the model weights them heavily.
     """
-    parts = [_LOGO_HARD_CONSTRAINTS]
-
-    # Style and palette upfront — most important creative parameters
-    parts.append(
-        f"DESIGN STYLE: {style}. "
-        f"COLOR PALETTE: Use ONLY these colors — {palette}. "
-        "Do not introduce colors outside this palette."
-    )
-
-    parts.append(f"Brand name: '{text}'.")
+    parts = [
+        _LOGO_HARD_CONSTRAINTS,
+        f"DESIGN STYLE: {style}. COLOR PALETTE: Use ONLY these colors — {palette}.",
+        f"Brand name: '{text}'.",
+    ]
 
     if description:
         parts.append(f"Brand context: {description}.")
@@ -171,9 +166,9 @@ def build_logo_prompt(
         )
 
     parts += [
-        "Keep the composition centered and balanced.",
-        "Vector-quality edges, professional finish, scalable to any size.",
-        f"Brand name '{text}' may appear as a wordmark only if it integrates naturally.",
+        "Centered, balanced composition.",
+        "Flat vector-style logo, clean edges, white background.",
+        f"Use the brand name '{text}' only if it fits naturally.",
     ]
 
     return " ".join(parts)
@@ -270,7 +265,11 @@ class GeminiService:
 # GPT image service (decodes base64 payloads and stores the result in R2)
 # ─────────────────────────────────────────────────────────────────────────────
 
-_OPENAI_IMAGE_TIMEOUT = 50   # seconds for the OpenAI images.generate call
+_OPENAI_IMAGE_TIMEOUT = int(os.getenv("OPENAI_IMAGE_TIMEOUT", "180"))
+_OPENAI_IMAGE_QUALITY = os.getenv("OPENAI_IMAGE_QUALITY", "low")
+_OPENAI_IMAGE_SIZE = os.getenv("OPENAI_IMAGE_SIZE", "1024x1024")
+_OPENAI_IMAGE_FORMAT = os.getenv("OPENAI_IMAGE_FORMAT", "jpeg")
+_OPENAI_IMAGE_COMPRESSION = int(os.getenv("OPENAI_IMAGE_COMPRESSION", "85"))
 
 
 def _decode_image_payload(b64_json: str) -> bytes:
@@ -301,9 +300,11 @@ class OpenAIImageService:
                     model="gpt-image-2-2026-04-21",
                     prompt=prompt,
                     n=1,
-                    size="1024x1024",
-                    quality="high",
+                    size=_OPENAI_IMAGE_SIZE,
+                    quality=_OPENAI_IMAGE_QUALITY,
                     background="opaque",
+                    output_format=_OPENAI_IMAGE_FORMAT,
+                    output_compression=_OPENAI_IMAGE_COMPRESSION,
                     user=brand,
                 ),
                 timeout=_OPENAI_IMAGE_TIMEOUT,
@@ -311,7 +312,7 @@ class OpenAIImageService:
         except asyncio.TimeoutError:
             raise RuntimeError(
                 f"GPT image did not respond within {_OPENAI_IMAGE_TIMEOUT} s. "
-                "Try again or switch to Gemini."
+                "The model may still be processing a complex prompt."
             )
 
         try:
