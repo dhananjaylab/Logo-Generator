@@ -18,7 +18,7 @@ import io
 import os
 import asyncio
 import time
-from typing import Tuple
+from typing import Optional, Tuple
 
 import boto3
 from botocore.config import Config
@@ -27,6 +27,8 @@ from google import genai
 from google.genai import types
 from openai import AsyncOpenAI
 
+from circuit_breaker import dalle_cb, gemini_cb, r2_cb
+from prom_metrics import errors_total, r2_upload_latency
 from utils import sanitize_filename
 from config import (
     R2_BUCKET_NAME,
@@ -35,9 +37,8 @@ from config import (
     R2_SESSION_TOKEN,
     R2_ENDPOINT_URL,
     R2_PUBLIC_DOMAIN,
-    DATABASE_URL,
 )
-from database import AsyncSessionLocal, LogoGeneration
+from repository import LogoRepository
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Cloudflare R2 / S3 Client
@@ -70,6 +71,7 @@ def upload_to_r2(data: bytes, filename: str, content_type: str = "image/png") ->
             "R2 upload failed: storage client not configured. "
             "Set R2_ACCESS_KEY_ID, R2_SECRET_ACCESS_KEY, R2_ENDPOINT_URL, R2_BUCKET_NAME."
         )
+    started = time.perf_counter()
     try:
         client.put_object(
             Bucket=R2_BUCKET_NAME,
@@ -77,10 +79,9 @@ def upload_to_r2(data: bytes, filename: str, content_type: str = "image/png") ->
             Body=data,
             ContentType=content_type,
         )
-        if R2_PUBLIC_DOMAIN:
-            return f"{R2_PUBLIC_DOMAIN}/{filename}"
-        return f"{R2_ENDPOINT_URL}/{R2_BUCKET_NAME}/{filename}"
     except Exception as exc:
+        r2_upload_latency.labels(status="failed").observe(time.perf_counter() - started)
+        errors_total.labels(error_type=type(exc).__name__, source="r2").inc()
         message = str(exc)
         if "Unauthorized" in message or "401" in message:
             message += (
@@ -88,6 +89,11 @@ def upload_to_r2(data: bytes, filename: str, content_type: str = "image/png") ->
                 "If you are using temporary R2 credentials, set R2_SESSION_TOKEN too."
             )
         raise RuntimeError(f"R2 upload failed for '{filename}': {message}") from exc
+    else:
+        r2_upload_latency.labels(status="success").observe(time.perf_counter() - started)
+        if R2_PUBLIC_DOMAIN:
+            return f"{R2_PUBLIC_DOMAIN}/{filename}"
+        return f"{R2_ENDPOINT_URL}/{R2_BUCKET_NAME}/{filename}"
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -189,7 +195,7 @@ def build_logo_prompt(
 _GEMINI_MODEL_TIMEOUT = 45
 
 _GEMINI_IMAGE_MODELS = [
-    "gemini-2.5-flash-image",     # if your API key has access
+    os.getenv("GEMINI_IMAGE_MODEL", "gemini-2.5-flash-image"),
 ]
 
 
@@ -208,12 +214,19 @@ class GeminiService:
 
     async def _try_model(self, model: str, prompt: str):
         try:
-            return await asyncio.wait_for(
-                asyncio.to_thread(self._call_model, model, prompt),
-                timeout=_GEMINI_MODEL_TIMEOUT,
+            return await gemini_cb.call(
+                asyncio.wait_for(
+                    asyncio.to_thread(self._call_model, model, prompt),
+                    timeout=_GEMINI_MODEL_TIMEOUT,
+                )
             )
         except asyncio.TimeoutError:
             print(f"[Gemini] '{model}' timed out after {_GEMINI_MODEL_TIMEOUT} s")
+            return None
+        except RuntimeError as exc:
+            if "[CB:" in str(exc):
+                raise
+            print(f"[Gemini] '{model}' failed: {exc}")
             return None
         except Exception as exc:
             print(f"[Gemini] '{model}' failed: {exc}")
@@ -257,7 +270,9 @@ class GeminiService:
                 if inline and getattr(inline, "data", None):
                     fname = _unique_filename(text, "gemini", variation_index)
                     # Upload directly to R2
-                    url = await asyncio.to_thread(upload_to_r2, inline.data, f"gemini/{fname}")
+                    url = await r2_cb.call(
+                        asyncio.to_thread(upload_to_r2, inline.data, f"gemini/{fname}")
+                    )
                     print(f"[Gemini] ✓ uploaded → {url}")
                     return url, prompt
 
@@ -303,19 +318,21 @@ class OpenAIImageService:
         Returns the public URL for the stored image.
         """
         try:
-            response = await asyncio.wait_for(
-                self.client.images.generate(
-                    model="gpt-image-2-2026-04-21",
-                    prompt=prompt,
-                    n=1,
-                    size=_OPENAI_IMAGE_SIZE,
-                    quality=_OPENAI_IMAGE_QUALITY,
-                    background="opaque",
-                    output_format=_OPENAI_IMAGE_FORMAT,
-                    output_compression=_OPENAI_IMAGE_COMPRESSION,
-                    user=brand,
+            response = await dalle_cb.call(
+                asyncio.wait_for(
+                    self.client.images.generate(
+                        model="gpt-image-2-2026-04-21",
+                        prompt=prompt,
+                        n=1,
+                        size=_OPENAI_IMAGE_SIZE,
+                        quality=_OPENAI_IMAGE_QUALITY,
+                        background="opaque",
+                        output_format=_OPENAI_IMAGE_FORMAT,
+                        output_compression=_OPENAI_IMAGE_COMPRESSION,
+                        user=brand,
+                    ),
+                    timeout=_OPENAI_IMAGE_TIMEOUT,
                 ),
-                timeout=_OPENAI_IMAGE_TIMEOUT,
             )
         except asyncio.TimeoutError:
             raise RuntimeError(
@@ -330,7 +347,9 @@ class OpenAIImageService:
 
         fname = _unique_filename(brand, "openai", variation_index)
         try:
-            url = await asyncio.to_thread(upload_to_r2, image_data, f"openai/{fname}")
+            url = await r2_cb.call(
+                asyncio.to_thread(upload_to_r2, image_data, f"openai/{fname}")
+            )
             print(f"[OpenAI Image] ✓ uploaded → {url}")
             return url
         except Exception as exc:
@@ -342,9 +361,15 @@ class OpenAIImageService:
 # ─────────────────────────────────────────────────────────────────────────────
 
 class LLMService:
-    def __init__(self, gemini_client: genai.Client, openai_client: AsyncOpenAI):
-        self.gemini = GeminiService(gemini_client)
-        self.openai_image = OpenAIImageService(openai_client)
+    def __init__(
+        self,
+        gemini_client: Optional[genai.Client],
+        openai_client: Optional[AsyncOpenAI],
+        repository: Optional[LogoRepository] = None,
+    ):
+        self.gemini = GeminiService(gemini_client) if gemini_client else None
+        self.openai_image = OpenAIImageService(openai_client) if openai_client else None
+        self._repo = repository
 
     @staticmethod
     def _is_gemini_quota_error(exc: Exception) -> bool:
@@ -355,37 +380,6 @@ class LLMService:
             or "429" in message
             or "rate limit" in message.lower()
         )
-
-    async def _save_to_db(
-        self, 
-        brand: str, 
-        prompt: str, 
-        generator: str, 
-        url: str, 
-        ip: str = None,
-        user_id: str = None
-    ) -> None:
-        """Asynchronously save generation metadata to PostgreSQL."""
-        if not AsyncSessionLocal:
-            print("[DB] ⚠ DATABASE_URL not set; skipping history save")
-            return
-
-        async with AsyncSessionLocal() as session:
-            try:
-                new_entry = LogoGeneration(
-                    brand_name=brand,
-                    prompt=prompt,
-                    generator=generator,
-                    image_url=url,
-                    ip_address=ip,
-                    user_id=user_id
-                )
-                session.add(new_entry)
-                await session.commit()
-                print(f"[DB] ✓ Logged generation for '{brand}' ({generator})")
-            except Exception as e:
-                print(f"[DB] ⚠ Failed to save history: {e}")
-                await session.rollback()
 
     async def generate_logo_with_openai_image(self, user_ip: str = None, **kwargs) -> Tuple[str, str]:
         """
@@ -429,10 +423,21 @@ class LLMService:
             variation_index=variation_index,
         )
         
+        if not self.openai_image:
+            raise RuntimeError("OpenAI image client is not configured.")
+
         local_path = await self.openai_image.generate_logo(prompt, brand=text, variation_index=variation_index)
         
         # Save to DB
-        await self._save_to_db(text, prompt, "gpt-image-2-2026-04-21", local_path, user_ip, user_id)
+        if self._repo:
+            await self._repo.save(
+                text,
+                prompt,
+                "gpt-image-2-2026-04-21",
+                local_path,
+                user_id,
+                user_ip,
+            )
         
         return local_path, prompt
 
@@ -479,6 +484,9 @@ class LLMService:
         
         # Call generate_logo with explicit parameters (no ** unpacking)
         try:
+            if not self.gemini:
+                raise RuntimeError("Gemini client is not configured.")
+
             url, prompt = await self.gemini.generate_logo(
                 text=text,
                 description=description,
@@ -500,6 +508,7 @@ class LLMService:
             raise
         
         # Save to DB
-        await self._save_to_db(text, prompt, "gemini", url, user_ip, user_id)
+        if self._repo:
+            await self._repo.save(text, prompt, "gemini", url, user_id, user_ip)
         
         return url, prompt

@@ -44,10 +44,12 @@ class LogoGenerationResponse(BaseModel):
 
 
 class HealthResponse(BaseModel):
-    """Health check response"""
-    status: str = Field(..., description="Service status")
-    gemini_ready: bool = Field(..., description="Gemini client ready")
-    openai_ready: bool = Field(..., description="OpenAI client ready")
+    """Health check response — used for liveness and readiness checks."""
+    status: str = Field(..., description="ok | degraded | error")
+    gemini_ready: bool = Field(..., description="Gemini client key configured")
+    openai_ready: bool = Field(..., description="OpenAI client key configured")
+    redis_ready: bool = Field(False, description="Redis reachable")
+    db_ready: bool = Field(False, description="PostgreSQL reachable")
 
 
 class LogoJobResponse(BaseModel):
