@@ -9,7 +9,7 @@ from google import genai
 
 from config import REDIS_URL, REDIS_SETTINGS
 from database import AsyncSessionLocal
-from prom_metrics import generation_requests, generation_latency, errors_total
+from prom_metrics import generation_requests, generation_latency, errors_total, job_retries_total, dlq_jobs_total, worker_max_jobs
 from repository import LogoRepository
 from services import LLMService
 from dependencies import Clients
@@ -44,6 +44,7 @@ async def _handle_permanent_failure(ctx, user_id: str, error: Exception, queue_n
         )
         await redis.lpush(queue_name, entry)
         await redis.ltrim(queue_name, 0, 999)
+        dlq_jobs_total.labels(queue=queue_name, generator="gemini").inc()
         logger.error(
             f"[Gemini Worker] Job {job_id} permanently failed after {retry_count + 1} attempt(s)."
         )
@@ -103,6 +104,7 @@ async def generate_gemini_task(ctx, user_ip: str, user_id: str, **kwargs):
     except Exception as exc:
         logger.error(f"[Gemini Worker] Generation failed: {exc}")
         errors_total.labels(error_type=type(exc).__name__, source="gemini_worker").inc()
+        job_retries_total.labels(generator="gemini", source="gemini_worker").inc()
         generation_latency.labels(generator="gemini", status="failed").observe(time.perf_counter() - started)
         if _is_final_attempt(ctx):
             await _handle_permanent_failure(ctx, user_id, exc, "dlq:gemini", kwargs.get("text", ""))
@@ -119,6 +121,7 @@ async def startup(ctx):
     # Store LLMService in context for reuse across tasks
     repo = LogoRepository(AsyncSessionLocal)
     ctx["llm_gemini"] = LLMService(gemini_client, None, repository=repo)
+    worker_max_jobs.labels(queue="gemini_queue").set(WorkerSettings.max_jobs)
 
 async def shutdown(ctx):
     logger.info("[Gemini Worker] Shutting down...")

@@ -6,7 +6,7 @@ from datetime import datetime, timezone
 
 from config import REDIS_SETTINGS
 from database import AsyncSessionLocal
-from prom_metrics import generation_requests, generation_latency, errors_total
+from prom_metrics import generation_requests, generation_latency, errors_total, job_retries_total, dlq_jobs_total, worker_max_jobs
 from repository import LogoRepository
 from services import LLMService
 from dependencies import Clients
@@ -41,6 +41,7 @@ async def _handle_permanent_failure(ctx, user_id: str, error: Exception, queue_n
         )
         await redis.lpush(queue_name, entry)
         await redis.ltrim(queue_name, 0, 999)
+        dlq_jobs_total.labels(queue=queue_name, generator="gpt-image-2-2026-04-21").inc()
         logger.error(
             f"[OpenAI Image Worker] Job {job_id} permanently failed after {retry_count + 1} attempt(s)."
         )
@@ -101,6 +102,7 @@ async def generate_openai_image_task(ctx, user_ip: str, user_id: str, **kwargs):
     except Exception as exc:
         logger.error(f"[OpenAI Image Worker] Generation failed: {exc}")
         errors_total.labels(error_type=type(exc).__name__, source="openai_image_worker").inc()
+        job_retries_total.labels(generator="gpt-image-2-2026-04-21", source="openai_image_worker").inc()
         generation_latency.labels(generator="gpt-image-2-2026-04-21", status="failed").observe(
             time.perf_counter() - started
         )
@@ -119,6 +121,7 @@ async def startup(ctx):
     openai_client = Clients.get_openai_client()
     repo = LogoRepository(AsyncSessionLocal)
     ctx["llm_openai_image"] = LLMService(None, openai_client, repository=repo)
+    worker_max_jobs.labels(queue="openai_image_queue").set(WorkerSettings.max_jobs)
 
 
 async def shutdown(ctx):

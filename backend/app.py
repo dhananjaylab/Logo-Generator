@@ -23,6 +23,8 @@ from database import init_db
 from limiter import limiter
 from arq import create_pool
 from config import REDIS_SETTINGS
+from dependencies import Clients
+from prom_metrics import component_ready
 from observability import metrics_middleware
 
 # (Limiter initialized in limiter.py)
@@ -33,10 +35,15 @@ async def lifespan(app: FastAPI):
     # Startup: Initialize database and create redis pool
     await init_db()
     logger.info("[OK] Database initialized")
+    component_ready.labels(component="db").set(1)
     
     # Create and store redis connection pool at startup (avoid per-request creation)
     app.state.redis = await create_pool(REDIS_SETTINGS)
     logger.info("[OK] Redis pool created at startup")
+    component_ready.labels(component="redis").set(1)
+    component_ready.labels(component="api").set(1)
+    component_ready.labels(component="openai").set(1 if Clients.is_openai_ready() else 0)
+    component_ready.labels(component="gemini").set(1 if Clients.is_gemini_ready() else 0)
     
     yield
     
