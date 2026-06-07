@@ -31,6 +31,9 @@ except Exception:  # pragma: no cover - fallback for environments without the pa
         def time(self):
             return _NoOpTimer()
 
+        def set(self, value):
+            pass
+
     Counter = Histogram = Gauge = lambda *args, **kwargs: _NoOpMetric()  # type: ignore[assignment]
 
 
