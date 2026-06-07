@@ -99,7 +99,10 @@ venv\Scripts\activate  # Windows
 pip install -r requirements.txt
 
 # 3. Prepare Prometheus multiprocess directory
+$env:PROMETHEUS_MULTIPROC_DIR = "$env:TEMP\prometheus_multiproc"
 New-Item -ItemType Directory -Force $env:PROMETHEUS_MULTIPROC_DIR | Out-Null
+
+echo $env:PROMETHEUS_MULTIPROC_DIR
 
 # 4. Start FastAPI server (in one terminal)
 uvicorn app:app --reload --port 8000
@@ -108,7 +111,7 @@ uvicorn app:app --reload --port 8000
 arq openai_image_worker.WorkerSettings
 arq gemini_worker.WorkerSettings
 ```
-*API runs on: http://localhost:8000/api/v1*
+*API runs on: http://localhost:8000*
 
 Useful backend endpoints:
 - `GET /api/v1/health` for readiness and dependency checks
@@ -203,6 +206,21 @@ curl http://localhost:8000/metrics
 cd next-frontend
 npm run dev
 ```
+
+## 📊 Monitoring
+
+Stakeholder-friendly Grafana assets live in [`monitoring/`](./monitoring).
+
+- Dashboard: [`monitoring/grafana/dashboards/logoforge-stakeholder-dashboard.json`](./monitoring/grafana/dashboards/logoforge-stakeholder-dashboard.json)
+- Metrics endpoint: `GET /metrics`
+- Health endpoint: `GET /api/v1/health`
+
+The dashboard is designed around five executive questions:
+- Traffic
+- Latency
+- Reliability
+- Readiness
+- Capacity
 
 ---
 

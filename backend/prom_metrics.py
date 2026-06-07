@@ -47,6 +47,18 @@ generation_latency = Histogram(
     buckets=[1, 3, 5, 10, 20, 35, 50, 75, 120],
 )
 
+job_retries_total = Counter(
+    "logoforge_job_retries_total",
+    "Total job retry attempts before final failure",
+    ["generator", "source"],
+)
+
+dlq_jobs_total = Counter(
+    "logoforge_dlq_jobs_total",
+    "Total jobs written to the dead-letter queue",
+    ["queue", "generator"],
+)
+
 http_requests_total = Counter(
     "logoforge_http_requests_total",
     "Total HTTP requests handled by the API",
@@ -71,6 +83,18 @@ queue_depth = Gauge(
     "logoforge_queue_depth",
     "Current job queue depth",
     ["queue"],
+)
+
+worker_max_jobs = Gauge(
+    "logoforge_worker_max_jobs",
+    "Configured worker concurrency limit",
+    ["queue"],
+)
+
+component_ready = Gauge(
+    "logoforge_component_ready",
+    "Readiness indicator for core platform dependencies",
+    ["component"],
 )
 
 errors_total = Counter(
