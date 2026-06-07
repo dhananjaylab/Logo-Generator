@@ -3,7 +3,7 @@ from pathlib import Path
 from contextlib import asynccontextmanager
 import logging
 from fastapi import FastAPI, Request
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, RedirectResponse, Response
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from slowapi import Limiter, _rate_limit_exceeded_handler
@@ -95,13 +95,51 @@ app.middleware("http")(metrics_middleware)
 app.include_router(logo_router)
 
 
+@app.api_route("/api", methods=["GET", "POST", "PUT", "DELETE", "OPTIONS", "PATCH", "HEAD"])
+async def legacy_api_root(request: Request):
+    target = "/api/v1"
+    if request.url.query:
+        target = f"{target}?{request.url.query}"
+    return RedirectResponse(url=target, status_code=307)
+
+
+@app.api_route("/api/{path:path}", methods=["GET", "POST", "PUT", "DELETE", "OPTIONS", "PATCH", "HEAD"])
+async def legacy_api_redirect(path: str, request: Request):
+    if path == "v1" or path.startswith("v1/"):
+        return JSONResponse(content={"detail": "Not Found"}, status_code=404)
+    target = f"/api/v1/{path}"
+    if request.url.query:
+        target = f"{target}?{request.url.query}"
+    return RedirectResponse(url=target, status_code=307)
+
+
+@app.get("/metrics", include_in_schema=False)
+async def metrics_endpoint():
+    """Prometheus scrape endpoint."""
+    try:
+        from prometheus_client import CONTENT_TYPE_LATEST, CollectorRegistry, generate_latest, multiprocess
+
+        registry = CollectorRegistry()
+        if os.getenv("PROMETHEUS_MULTIPROC_DIR"):
+            multiprocess.MultiProcessCollector(registry)
+            content = generate_latest(registry)
+        else:
+            from prometheus_client import REGISTRY
+
+            content = generate_latest(REGISTRY)
+        return Response(content=content, media_type=CONTENT_TYPE_LATEST)
+    except Exception as exc:
+        logger.warning(f"[Metrics] Prometheus endpoint unavailable: {exc}")
+        return Response(content="prometheus metrics unavailable\n", status_code=503, media_type="text/plain")
+
+
 @app.get("/")
 async def root():
     return {
         "message": "Logo Generator API v2.1",
         "docs":    "/docs",
-        "health":  "/api/health",
-        "generate":"/api/generate",
+        "health":  "/api/v1/health",
+        "generate":"/api/v1/generate",
         "static":  "/static/generated_logos/<gemini|openai>/<filename>",
     }
 
