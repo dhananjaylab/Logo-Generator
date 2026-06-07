@@ -47,7 +47,7 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="Logo Generator API",
-    description="Generate logos using Gemini or DALL-E 3",
+    description="Generate logos using Gemini or GPT image",
     version="2.1.0",
     lifespan=lifespan,
 )
@@ -102,7 +102,7 @@ async def root():
         "docs":    "/docs",
         "health":  "/api/health",
         "generate":"/api/generate",
-        "static":  "/static/generated_logos/<gemini|dalle>/<filename>",
+        "static":  "/static/generated_logos/<gemini|openai>/<filename>",
     }
 
 

@@ -100,55 +100,49 @@ class ClerkAuthProvider:
         
         return cls._jwks_cache
 
-async def validate_clerk_token(credentials: HTTPAuthorizationCredentials = Depends(security)):
-    """FastAPI dependency to validate Clerk JWT"""
-    token = credentials.credentials
-    
-    # ── Dev Token Bypass (DEV only, not in PROD) ────────────────────────────
-    # For local testing, allow a pre-configured developer token
-    # ONLY if ENV != "production"
+
+async def validate_token_string(token: str | None) -> dict:
+    """
+    Validate a raw token string (for use by endpoints that receive tokens
+    outside the standard Authorization header — e.g. WebSocket query params).
+    Raises HTTPException on failure, returns the JWT payload dict on success.
+    """
+    if not token:
+        raise HTTPException(
+            status_code=401,
+            detail="Missing authentication token",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+
     is_production = os.getenv("ENV") == "production"
     dev_token = os.getenv("DEV_TOKEN")
-    
+
+    # Dev token bypass (non-production only)
     if dev_token and token == dev_token:
         if is_production:
-            logger.error("[AUTH] ❌ DEV_TOKEN used in production - rejecting")
-            raise HTTPException(
-                status_code=403,
-                detail="Dev tokens not allowed in production",
-                headers={"WWW-Authenticate": "Bearer"},
-            )
+            logger.error("[AUTH] ❌ DEV_TOKEN used in production — rejecting")
+            raise HTTPException(status_code=403, detail="Dev tokens not allowed in production")
         logger.info("[AUTH] ✅ Authorized via DEV_TOKEN (dev mode)")
         return {"sub": "developer", "status": "verified_via_dev_token"}
 
-    # ── Clerk JWT Validation ────────────────────────────────────────────────
+    # Clerk JWT validation
     jwks = await ClerkAuthProvider.get_jwks()
-    
     if not jwks:
         if is_production:
-            logger.error("[AUTH] JWKS not available in production")
-            raise HTTPException(
-                status_code=500, 
-                detail="Authentication service unavailable"
-            )
-        # In dev mode, allow unverified if JWKS not configured
-        logger.warning("[AUTH] ⚠ Skipping validation - JWKS not configured (dev mode)")
+            raise HTTPException(status_code=500, detail="Authentication service unavailable")
+        logger.warning("[AUTH] ⚠ Skipping validation — JWKS not configured (dev mode)")
         return {"sub": "anonymous", "status": "unverified"}
 
     try:
-        # Clerk expects: audience = "http://localhost:3000" or your frontend URL
-        # In production, verify_aud must be True
         verify_aud = is_production
         audience = os.getenv("CLERK_AUDIENCE", os.getenv("NEXT_PUBLIC_API_URL", "http://localhost:3000"))
-        
         payload = jwt.decode(
-            token, 
-            jwks, 
+            token,
+            jwks,
             algorithms=["RS256"],
             audience=audience if verify_aud else None,
-            options={"verify_aud": verify_aud}
+            options={"verify_aud": verify_aud},
         )
-        
         logger.info(f"[AUTH] ✅ JWT validated for user: {payload.get('sub')}")
         return payload
     except Exception as e:
@@ -158,3 +152,8 @@ async def validate_clerk_token(credentials: HTTPAuthorizationCredentials = Depen
             detail="Invalid or expired token",
             headers={"WWW-Authenticate": "Bearer"},
         )
+
+
+async def validate_clerk_token(credentials: HTTPAuthorizationCredentials = Depends(security)) -> dict:
+    """FastAPI dependency. Validates the Authorization: Bearer <token> header."""
+    return await validate_token_string(credentials.credentials)

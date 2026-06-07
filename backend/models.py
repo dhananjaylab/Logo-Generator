@@ -9,7 +9,10 @@ class LogoGenerationRequest(BaseModel):
     description: Optional[str] = Field("", description="Brand description")
     style: str = Field("minimalist", description="Logo style")
     palette: str = Field("monochrome", description="Color palette")
-    generator: str = Field("dalle-3", description="Image generator: 'dalle-3' or 'gemini'")
+    generator: str = Field(
+        "gpt-image-2-2026-04-21",
+        description="Image generator: 'gpt-image-2-2026-04-21' or 'gemini'",
+    )
     
     # Advanced branding fields
     tagline: Optional[str] = Field("", description="Brand tagline or slogan")

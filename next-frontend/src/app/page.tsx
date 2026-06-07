@@ -10,7 +10,7 @@ import { getAuthToken, getApiUrl, getWsUrl, authenticatedFetch } from '../lib/au
 import type { LogoGenerationResponse, JobStatusResponse } from '../lib/types';
 
 export default function LogoForge() {
-  const [generator, setGenerator] = useState('dalle-3');
+  const [generator, setGenerator] = useState('gpt-image-2-2026-04-21');
   const [style, setStyle] = useState('minimalist');
   const [palette, setPalette] = useState('monochrome');
   const [brandName, setBrandName] = useState('');
@@ -74,7 +74,7 @@ export default function LogoForge() {
   };
 
   // Helper: process job result (from WebSocket or polling)
-  const handleJobResult = (result: LogoGenerationResponse | null, isError: boolean = false) => {
+  const handleJobResult = (result: LogoGenerationResponse | JobStatusResponse | null, isError: boolean = false) => {
     if (progressSimRef.current) clearInterval(progressSimRef.current);
     if (isError) {
       alert(`Error: ${(result as any)?.error || result}`);
@@ -85,7 +85,7 @@ export default function LogoForge() {
     setProgressValue(100);
     setProgressLabel('Complete');
     
-    if (result && result.result) {
+    if (result && 'result' in result && result.result) {
       // Handle both string and array result shapes
       let imgUrl: string | undefined;
       if (typeof result.result === 'string') {
@@ -117,7 +117,7 @@ export default function LogoForge() {
     setGenerating(true);
     setProgressValue(5);
     setProgressLabel(`Connecting to ${generator}...`);
-    simulateProgress(5, generator === 'dalle-3' ? 12000 : 8000);
+    simulateProgress(5, generator === 'gpt-image-2-2026-04-21' ? 12000 : 8000);
     setLogoSrc(null);
 
     const API_URL = getApiUrl();
@@ -283,7 +283,7 @@ export default function LogoForge() {
           <div>
             <div className={styles.sectionTitle}><Cpu size={13} /> AI Generator</div>
             <div className={styles.grid2}>
-              <button className={`${styles.chip} ${generator === 'dalle-3' ? styles.active : ''}`} onClick={() => setGenerator('dalle-3')}>🎨 DALL-E 3</button>
+              <button className={`${styles.chip} ${generator === 'gpt-image-2-2026-04-21' ? styles.active : ''}`} onClick={() => setGenerator('gpt-image-2-2026-04-21')}>🎨 GPT Image 2</button>
               <button className={`${styles.chip} ${generator === 'gemini' ? styles.active : ''}`} onClick={() => setGenerator('gemini')}>✨ Gemini</button>
             </div>
           </div>

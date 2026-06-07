@@ -5,7 +5,7 @@ from pathlib import Path
 def ensure_output_directory(directory: str = "generated_logos") -> str:
     """
     Ensure output directory (and any parents) exist. Returns the path string.
-    Supports nested paths like 'generated_logos/dalle'.
+    Supports nested paths like 'generated_logos/openai'.
     """
     output_dir = Path(directory)
     output_dir.mkdir(parents=True, exist_ok=True)
