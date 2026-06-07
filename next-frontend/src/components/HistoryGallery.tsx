@@ -55,7 +55,7 @@ export default function HistoryGallery({
   }, [fetchHistory]);
 
   const handleSelect = (item: HistoryItem) => {
-    onSelect(item.brand_name, resolveImageUrl(item.image_url));
+    onSelect(item.brand_name, resolveImageUrl(item.image_url) || '');
   };
 
   return (
@@ -77,7 +77,7 @@ export default function HistoryGallery({
             <div className={styles.galleryLoading}>No history found yet.</div>
           )}
           {!loading && history.map(item => {
-            const src = resolveImageUrl(item.image_url);
+            const src = resolveImageUrl(item.image_url) || '';
             
             return (
                <div key={item.id} className={styles.galleryItem} onClick={() => handleSelect(item)}>
