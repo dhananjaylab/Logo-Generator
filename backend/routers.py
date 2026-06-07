@@ -53,7 +53,7 @@ async def generate_logo(
     user_id = user.get("sub", "anonymous")
     print(f"[API] Logo request from user: {user_id} (IP: {user_ip})")
     # ── Validate ──────────────────────────────────────────────────────────
-    if logo_request.generator == "dalle-3":
+    if logo_request.generator == "gpt-image-2-2026-04-21":
         if not openai_client:
             raise HTTPException(500, "OpenAI API client not initialised.")
     elif logo_request.generator == "gemini":
@@ -90,8 +90,8 @@ async def generate_logo(
     )
 
     # Enqueue the job to the specific queue
-    queue_name = "dalle_queue" if logo_request.generator == "dalle-3" else "gemini_queue"
-    function_name = "generate_dalle_task" if logo_request.generator == "dalle-3" else "generate_gemini_task"
+    queue_name = "openai_image_queue" if logo_request.generator == "gpt-image-2-2026-04-21" else "gemini_queue"
+    function_name = "generate_openai_image_task" if logo_request.generator == "gpt-image-2-2026-04-21" else "generate_gemini_task"
     
     job = await redis.enqueue_job(
         function_name,
@@ -123,7 +123,7 @@ async def get_job_status(
     from arq.jobs import Job
     
     # Check all specialized queues to find where the job is currently living
-    queues_to_search = ["dalle_queue", "gemini_queue", "arq:queue"]
+    queues_to_search = ["openai_image_queue", "gemini_queue", "arq:queue"]
     job_instance = None
     status = "not_found"
     
@@ -249,7 +249,7 @@ async def ws_progress(websocket: WebSocket, job_id: str):
         await pubsub.subscribe(channel)
 
         # Check if job already completed while we were subscribing.
-        queues = ["dalle_queue", "gemini_queue", "arq:queue"]
+        queues = ["openai_image_queue", "gemini_queue", "arq:queue"]
         for q in queues:
             job_obj = Job(job_id, redis, _queue_name=q)
             status = await job_obj.status()

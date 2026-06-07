@@ -1,37 +1,25 @@
 """
 services.py – Logo generation services.
 
-Fixes in this version
-─────────────────────
-1. PROMPT: Explicit "logo mark ONLY" constraints at the TOP of every prompt
-   stop DALL-E from generating business-card scenes / mockups. A hard
-   negative list ("NO mockups, NO 3D renders, NO staging…") is prepended.
+This module now uses the GPT image model for OpenAI-backed generation.
 
-2. UNIQUE FILENAMES: Every generated file gets a timestamp+variation suffix
-   so repeated calls never serve a cached file from disk.
-   Gemini: generated_logos/gemini/<brand>_<ts>_v<n>.png
-   DALL-E: generated_logos/dalle/<brand>_<ts>_v<n>.png
-
-3. DALL-E LOCAL SAVE: After getting the temporary OpenAI URL, the image is
-   downloaded and stored locally (generated_logos/dalle/). The local path
-   is returned instead of the expiring URL, making downloads reliable.
-
-4. STYLE / PALETTE PROMINENCE: Style and color palette appear at the very
-   start of the prompt (after the hard constraints), not buried at the end,
-   so Gemini/DALL-E give them proper weight.
-
-5. asyncio timeouts and response_modalities=["IMAGE"] retained from
-   previous version.
+Key behaviors:
+1. Prompt construction still enforces "logo mark only" constraints first.
+2. Every generated file gets a timestamp+variation suffix so repeated calls
+   never reuse stale files.
+3. GPT image responses arrive as base64 payloads, so we decode them and upload
+   the resulting bytes directly to R2.
+4. Style and palette remain at the front of the prompt so they retain weight.
 """
 
+import base64
+import binascii
 import io
 import os
 import asyncio
 import time
-import tempfile
 from typing import Tuple
 
-import requests as _requests      # synchronous – used in to_thread for DALL-E download
 import boto3
 from botocore.config import Config
 from PIL import Image
@@ -114,7 +102,7 @@ def _unique_filename(brand: str, generator: str, variation_index: int) -> str:
 # ─────────────────────────────────────────────────────────────────────────────
 
 # Hard constraints injected at the START of every prompt.
-# They appear before any brand/style instructions so DALL-E and Gemini
+# They appear before any brand/style instructions so GPT image and Gemini
 # don't drift into "scene" or "mockup" mode.
 _LOGO_HARD_CONSTRAINTS = (
     "OUTPUT REQUIREMENT: A single, isolated, flat 2D logo mark on a pure white background. "
@@ -279,22 +267,24 @@ class GeminiService:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# DALL-E service  (saves image locally so the URL never expires)
+# GPT image service (decodes base64 payloads and stores the result in R2)
 # ─────────────────────────────────────────────────────────────────────────────
 
-_DALLE_TIMEOUT     = 50   # seconds for the OpenAI images.generate call
-_DALLE_DL_TIMEOUT  = 20   # seconds to download the returned URL
+_OPENAI_IMAGE_TIMEOUT = 50   # seconds for the OpenAI images.generate call
 
 
-def _download_image(url: str, dest_path: str) -> None:
-    """Download a URL to disk synchronously (called via to_thread)."""
-    resp = _requests.get(url, timeout=_DALLE_DL_TIMEOUT)
-    resp.raise_for_status()
-    img = Image.open(io.BytesIO(resp.content))
-    img.save(dest_path)
+def _decode_image_payload(b64_json: str) -> bytes:
+    """Decode GPT image base64 payloads into raw image bytes."""
+    if not b64_json:
+        raise ValueError("OpenAI image response did not include image data")
+
+    image_bytes = base64.b64decode(b64_json)
+    with Image.open(io.BytesIO(image_bytes)) as img:
+        img.load()
+    return image_bytes
 
 
-class DALLEService:
+class OpenAIImageService:
     def __init__(self, client: AsyncOpenAI):
         self.client = client
 
@@ -302,51 +292,40 @@ class DALLEService:
         self, prompt: str, brand: str = "logo", variation_index: int = 0
     ) -> str:
         """
-        Generate with DALL-E 3, download the result, save locally.
-        Returns the relative path (e.g. generated_logos/dalle/dalle_Brand_<ts>_v0.png)
-        so it can be served via FastAPI's /static/ mount — no expiring URLs.
+        Generate an image with GPT image, validate it, and upload it to R2.
+        Returns the public URL for the stored image.
         """
         try:
             response = await asyncio.wait_for(
                 self.client.images.generate(
-                    model="dall-e-3",
+                    model="gpt-image-2-2026-04-21",
                     prompt=prompt,
                     n=1,
                     size="1024x1024",
-                    quality="hd",
-                    style="natural",
+                    quality="high",
+                    background="opaque",
+                    user=brand,
                 ),
-                timeout=_DALLE_TIMEOUT,
+                timeout=_OPENAI_IMAGE_TIMEOUT,
             )
         except asyncio.TimeoutError:
             raise RuntimeError(
-                f"DALL-E 3 did not respond within {_DALLE_TIMEOUT} s. "
+                f"GPT image did not respond within {_OPENAI_IMAGE_TIMEOUT} s. "
                 "Try again or switch to Gemini."
             )
 
-        image_url = response.data[0].url
-
-        # Download and validate image (via _download_image helper) and generate unique filename
-        fname = _unique_filename(brand, "dalle", variation_index)
-        tmp_dir = tempfile.gettempdir()  # Platform-aware temp directory (Windows: %TEMP%, Linux: /tmp)
-        tmp_path = os.path.join(tmp_dir, fname)
         try:
-            await asyncio.to_thread(_download_image, image_url, tmp_path)
-            with open(tmp_path, "rb") as f:
-                image_data = f.read()
-            os.unlink(tmp_path)
-        except Exception as exc:
-            print(f"[DALL-E] ⚠ Download/validation failed ({exc}); returning raw URL")
-            return image_url
+            image_data = _decode_image_payload(response.data[0].b64_json)
+        except (IndexError, AttributeError, ValueError, binascii.Error) as exc:
+            raise RuntimeError(f"GPT image response did not include valid image bytes: {exc}") from exc
 
-        # Upload to R2
+        fname = _unique_filename(brand, "openai", variation_index)
         try:
-            url = await asyncio.to_thread(upload_to_r2, image_data, f"dalle/{fname}")
-            print(f"[DALL-E] ✓ uploaded → {url}")
+            url = await asyncio.to_thread(upload_to_r2, image_data, f"openai/{fname}")
+            print(f"[OpenAI Image] ✓ uploaded → {url}")
             return url
         except Exception as exc:
-            print(f"[DALL-E] ⚠ R2 upload failed ({exc}); returning raw URL")
-            return image_url
+            raise RuntimeError(f"OpenAI image upload failed: {exc}") from exc
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -356,7 +335,7 @@ class DALLEService:
 class LLMService:
     def __init__(self, gemini_client: genai.Client, openai_client: AsyncOpenAI):
         self.gemini = GeminiService(gemini_client)
-        self.dalle  = DALLEService(openai_client)
+        self.openai_image = OpenAIImageService(openai_client)
 
     async def _save_to_db(
         self, 
@@ -389,9 +368,9 @@ class LLMService:
                 print(f"[DB] ⚠ Failed to save history: {e}")
                 await session.rollback()
 
-    async def generate_logo_with_dalle(self, user_ip: str = None, **kwargs) -> Tuple[str, str]:
+    async def generate_logo_with_openai_image(self, user_ip: str = None, **kwargs) -> Tuple[str, str]:
         """
-        Generate a logo using DALL-E 3.
+        Generate a logo using the GPT image model.
         
         Explicitly extracts parameters from kwargs to avoid collisions
         where 'text' or other parameter names could shadow function arguments.
@@ -414,7 +393,7 @@ class LLMService:
         
         # Any remaining kwargs would be an error, so we could log them
         if kwargs:
-            print(f"[DALL-E] ⚠ Unexpected kwargs: {kwargs.keys()}")
+            print(f"[OpenAI Image] ⚠ Unexpected kwargs: {kwargs.keys()}")
         
         # Build prompt with explicit parameters (no ** unpacking)
         prompt = build_logo_prompt(
@@ -431,10 +410,10 @@ class LLMService:
             variation_index=variation_index,
         )
         
-        local_path = await self.dalle.generate_logo(prompt, brand=text, variation_index=variation_index)
+        local_path = await self.openai_image.generate_logo(prompt, brand=text, variation_index=variation_index)
         
         # Save to DB
-        await self._save_to_db(text, prompt, "dalle-3", local_path, user_ip, user_id)
+        await self._save_to_db(text, prompt, "gpt-image-2-2026-04-21", local_path, user_ip, user_id)
         
         return local_path, prompt
 
