@@ -346,6 +346,16 @@ class LLMService:
         self.gemini = GeminiService(gemini_client)
         self.openai_image = OpenAIImageService(openai_client)
 
+    @staticmethod
+    def _is_gemini_quota_error(exc: Exception) -> bool:
+        message = str(exc)
+        return (
+            "RESOURCE_EXHAUSTED" in message
+            or "quota" in message.lower()
+            or "429" in message
+            or "rate limit" in message.lower()
+        )
+
     async def _save_to_db(
         self, 
         brand: str, 
@@ -451,9 +461,8 @@ class LLMService:
         # Any remaining kwargs would be an error, so we could log them
         if kwargs:
             print(f"[Gemini] ⚠ Unexpected kwargs: {kwargs.keys()}")
-        
-        # Call generate_logo with explicit parameters (no ** unpacking)
-        url, prompt = await self.gemini.generate_logo(
+
+        fallback_kwargs = dict(
             text=text,
             description=description,
             style=style,
@@ -465,7 +474,30 @@ class LLMService:
             brand_mission=brand_mission,
             variation_hint=variation_hint,
             variation_index=variation_index,
+            user_id=user_id,
         )
+        
+        # Call generate_logo with explicit parameters (no ** unpacking)
+        try:
+            url, prompt = await self.gemini.generate_logo(
+                text=text,
+                description=description,
+                style=style,
+                palette=palette,
+                tagline=tagline,
+                typography=typography,
+                elements_to_include=elements_to_include,
+                elements_to_avoid=elements_to_avoid,
+                brand_mission=brand_mission,
+                variation_hint=variation_hint,
+                variation_index=variation_index,
+            )
+        except Exception as exc:
+            if self._is_gemini_quota_error(exc):
+                print("[Gemini] ⚠ Quota exhausted; falling back to GPT image generation")
+                url, prompt = await self.generate_logo_with_openai_image(user_ip=user_ip, **fallback_kwargs)
+                return url, prompt
+            raise
         
         # Save to DB
         await self._save_to_db(text, prompt, "gemini", url, user_ip, user_id)
