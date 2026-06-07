@@ -32,6 +32,7 @@ from config import (
     R2_BUCKET_NAME,
     R2_ACCESS_KEY_ID,
     R2_SECRET_ACCESS_KEY,
+    R2_SESSION_TOKEN,
     R2_ENDPOINT_URL,
     R2_PUBLIC_DOMAIN,
     DATABASE_URL,
@@ -52,6 +53,7 @@ def get_r2_client():
         endpoint_url=R2_ENDPOINT_URL,
         aws_access_key_id=R2_ACCESS_KEY_ID,
         aws_secret_access_key=R2_SECRET_ACCESS_KEY,
+        aws_session_token=R2_SESSION_TOKEN or None,
         config=Config(signature_version="s3v4"),
         region_name="auto",  # R2 expects 'auto' or a specific region
     )
@@ -79,7 +81,13 @@ def upload_to_r2(data: bytes, filename: str, content_type: str = "image/png") ->
             return f"{R2_PUBLIC_DOMAIN}/{filename}"
         return f"{R2_ENDPOINT_URL}/{R2_BUCKET_NAME}/{filename}"
     except Exception as exc:
-        raise RuntimeError(f"R2 upload failed for '{filename}': {exc}") from exc
+        message = str(exc)
+        if "Unauthorized" in message or "401" in message:
+            message += (
+                " Check that the R2 token has Object Read & Write permission for this bucket. "
+                "If you are using temporary R2 credentials, set R2_SESSION_TOKEN too."
+            )
+        raise RuntimeError(f"R2 upload failed for '{filename}': {message}") from exc
 
 
 # ─────────────────────────────────────────────────────────────────────────────
