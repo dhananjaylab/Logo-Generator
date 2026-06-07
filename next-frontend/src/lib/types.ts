@@ -39,7 +39,7 @@ export interface HistoryEntry {
 export interface LogoGenerationRequest {
   brand_name: string;
   description: string;
-  generator: 'dalle-3' | 'gemini';
+  generator: 'gpt-image-2-2026-04-21' | 'gemini';
   style: string;
   palette: string;
   tagline?: string;
