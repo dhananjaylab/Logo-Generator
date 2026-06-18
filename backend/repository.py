@@ -28,12 +28,19 @@ class LogoRepository:
         generator: str,
         image_url: str,
         user_id: Optional[str] = None,
-        ip_address: Optional[str] = None,
+        ip_hash: Optional[str] = None,
     ) -> None:
         """
-        Persist a generation record. Failures are logged but not re-raised
-        so that a DB write error never causes a completed generation to appear
-        failed to the end user.
+        Persist a generation record.
+
+        SECURITY NOTE (P1.4): The `ip_hash` parameter receives an already-
+        anonymised value (16-char hex) from utils.anonymise_ip(). Raw IP
+        addresses must never be passed here — anonymisation must happen in
+        the caller (routers.py) before the job is enqueued, so the raw IP
+        never leaves the request-handling process.
+
+        Failures are logged but not re-raised so that a DB write error
+        never causes a completed generation to appear failed to the user.
         """
         if not self._factory:
             logger.warning("[Repo] No database configured - skipping history save")
@@ -48,7 +55,7 @@ class LogoRepository:
                         generator=generator,
                         image_url=image_url,
                         user_id=user_id,
-                        ip_address=ip_address,
+                        ip_hash=ip_hash,          # anonymised — never raw IP
                     )
                 )
                 await session.commit()
