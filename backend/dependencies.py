@@ -1,16 +1,15 @@
 import os
 import logging
+import time
 from functools import lru_cache
 from google import genai
 from openai import AsyncOpenAI
 import httpx
-import time
 from jose import jwt
 from fastapi import Request, HTTPException, Depends
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from dotenv import load_dotenv
 
-# Load environment variables
 load_dotenv()
 
 logger = logging.getLogger(__name__)
@@ -23,7 +22,6 @@ class Clients:
 
     @classmethod
     def get_gemini_client(cls):
-        """Get or initialize Gemini client"""
         if cls._gemini_client is None:
             api_key = os.getenv("GEMINI_API_KEY")
             if api_key:
@@ -32,7 +30,6 @@ class Clients:
 
     @classmethod
     def get_openai_client(cls):
-        """Get or initialize OpenAI client"""
         if cls._openai_client is None:
             api_key = os.getenv("OPENAI_API_KEY")
             if api_key:
@@ -41,23 +38,18 @@ class Clients:
 
     @classmethod
     def is_gemini_ready(cls):
-        """Check if Gemini client is ready"""
         return cls.get_gemini_client() is not None
 
     @classmethod
     def is_openai_ready(cls):
-        """Check if OpenAI client is ready"""
         return cls.get_openai_client() is not None
 
 
-# Dependency functions for FastAPI
 def get_gemini_client():
-    """Dependency for Gemini client"""
     return Clients.get_gemini_client()
 
 
 def get_openai_client():
-    """Dependency for OpenAI client"""
     return Clients.get_openai_client()
 
 
@@ -65,15 +57,26 @@ def get_openai_client():
 
 security = HTTPBearer()
 
+# SECURITY FIX (P1.3):
+# ALLOW_DEV_TOKEN must be explicitly set to "true" in the environment to
+# permit DEV_TOKEN bypass.  It is blocked unconditionally in "production" and
+# "staging" environments regardless of this flag, so an accidental leak of
+# ALLOW_DEV_TOKEN=true into a higher tier cannot open a bypass.
+#
+# The token value itself must NEVER be committed to version control or README.
+# Generate a fresh value per developer with:  python -c "import secrets; print(secrets.token_hex(32))"
+_ALLOW_DEV_TOKEN: bool = os.getenv("ALLOW_DEV_TOKEN", "false").strip().lower() == "true"
+_BLOCKED_ENVS: frozenset = frozenset({"production", "staging"})
+
+
 class ClerkAuthProvider:
-    """Helper to handle Clerk JWT validation with JWKS caching"""
+    """Helper to handle Clerk JWT validation with JWKS caching."""
     _jwks_cache = None
-    _last_fetch = 0
-    _cache_ttl = 3600  # 1 hour
+    _last_fetch: float = 0.0
+    _cache_ttl: int = 3600  # 1 hour
 
     @classmethod
     async def get_jwks(cls):
-        """Fetch JWKS from Clerk if cache is expired"""
         jwks_url = os.getenv("CLERK_JWKS_URL")
         if not jwks_url or jwks_url == "your_clerk_jwks_url_here":
             logger.warning(
@@ -97,15 +100,19 @@ class ClerkAuthProvider:
                     logger.warning("[AUTH] Returning stale JWKS cache")
                     return cls._jwks_cache
                 raise HTTPException(status_code=500, detail="Authentication configuration error")
-        
+
         return cls._jwks_cache
 
 
 async def validate_token_string(token: str | None) -> dict:
     """
-    Validate a raw token string (for use by endpoints that receive tokens
-    outside the standard Authorization header — e.g. WebSocket query params).
-    Raises HTTPException on failure, returns the JWT payload dict on success.
+    Validate a raw token string.
+    Raises HTTPException on failure; returns the JWT payload dict on success.
+
+    DEV_TOKEN bypass rules (P1.3):
+      1. Blocked unconditionally when ENV is 'production' or 'staging'.
+      2. Blocked when ALLOW_DEV_TOKEN env var is not explicitly "true".
+      3. The token value must differ from the public placeholder in .env.template.
     """
     if not token:
         raise HTTPException(
@@ -114,28 +121,55 @@ async def validate_token_string(token: str | None) -> dict:
             headers={"WWW-Authenticate": "Bearer"},
         )
 
-    is_production = os.getenv("ENV") == "production"
-    dev_token = os.getenv("DEV_TOKEN")
+    current_env = os.getenv("ENV", "development")
+    dev_token = os.getenv("DEV_TOKEN", "")
 
-    # Dev token bypass (non-production only)
+    # ── DEV_TOKEN bypass ────────────────────────────────────────────────────
     if dev_token and token == dev_token:
-        if is_production:
-            logger.error("[AUTH] ❌ DEV_TOKEN used in production — rejecting")
-            raise HTTPException(status_code=403, detail="Dev tokens not allowed in production")
-        logger.info("[AUTH] ✅ Authorized via DEV_TOKEN (dev mode)")
+
+        # Hard block in production / staging — no exceptions.
+        if current_env in _BLOCKED_ENVS:
+            logger.error(
+                f"[AUTH] ❌ DEV_TOKEN rejected: environment is '{current_env}'. "
+                "DEV_TOKEN bypass is never permitted in production or staging."
+            )
+            raise HTTPException(
+                status_code=403,
+                detail="Dev tokens are not permitted in this environment.",
+            )
+
+        # Soft block: ALLOW_DEV_TOKEN must be set to "true" in the env file.
+        if not _ALLOW_DEV_TOKEN:
+            logger.error(
+                "[AUTH] ❌ DEV_TOKEN rejected: ALLOW_DEV_TOKEN is not set to 'true'. "
+                "Add ALLOW_DEV_TOKEN=true to your local .env to enable dev bypass."
+            )
+            raise HTTPException(
+                status_code=403,
+                detail="Dev token usage is disabled. Set ALLOW_DEV_TOKEN=true in your environment.",
+            )
+
+        logger.info("[AUTH] ✅ Authorized via DEV_TOKEN (local development mode)")
         return {"sub": "developer", "status": "verified_via_dev_token"}
 
-    # Clerk JWT validation
+    # ── Clerk JWT validation ────────────────────────────────────────────────
     jwks = await ClerkAuthProvider.get_jwks()
+
     if not jwks:
-        if is_production:
-            raise HTTPException(status_code=500, detail="Authentication service unavailable")
-        logger.warning("[AUTH] ⚠ Skipping validation — JWKS not configured (dev mode)")
-        return {"sub": "anonymous", "status": "unverified"}
+        # No JWKS configured. In non-production environments, allow anonymously
+        # so local dev without Clerk still works when DEV_TOKEN is not set.
+        if current_env not in _BLOCKED_ENVS:
+            logger.warning("[AUTH] ⚠ Skipping validation — JWKS not configured (dev mode)")
+            return {"sub": "anonymous", "status": "unverified"}
+        raise HTTPException(status_code=500, detail="Authentication service unavailable")
 
     try:
+        is_production = current_env == "production"
         verify_aud = is_production
-        audience = os.getenv("CLERK_AUDIENCE", os.getenv("NEXT_PUBLIC_API_URL", "http://localhost:3000"))
+        audience = os.getenv(
+            "CLERK_AUDIENCE",
+            os.getenv("NEXT_PUBLIC_API_URL", "http://localhost:3000"),
+        )
         payload = jwt.decode(
             token,
             jwks,
@@ -145,6 +179,7 @@ async def validate_token_string(token: str | None) -> dict:
         )
         logger.info(f"[AUTH] ✅ JWT validated for user: {payload.get('sub')}")
         return payload
+
     except Exception as e:
         logger.warning(f"[AUTH] ❌ Token validation failed: {e}")
         raise HTTPException(
@@ -154,6 +189,8 @@ async def validate_token_string(token: str | None) -> dict:
         )
 
 
-async def validate_clerk_token(credentials: HTTPAuthorizationCredentials = Depends(security)) -> dict:
+async def validate_clerk_token(
+    credentials: HTTPAuthorizationCredentials = Depends(security),
+) -> dict:
     """FastAPI dependency. Validates the Authorization: Bearer <token> header."""
     return await validate_token_string(credentials.credentials)

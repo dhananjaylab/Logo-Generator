@@ -1,5 +1,10 @@
 /**
- * TypeScript type definitions for Logo Generator API
+ * TypeScript type definitions for Logo Generator API.
+ *
+ * SECURITY FIX (P1.6): HistoryEntry no longer includes ip_address or user_id.
+ * The backend HistoryEntryResponse model explicitly excludes those fields, and
+ * the frontend type mirrors that contract so no accidental rendering or logging
+ * of sensitive data can occur client-side.
  */
 
 export interface LogoGenerationResponse {
@@ -19,6 +24,11 @@ export interface JobStatusResponse {
   error?: string;
 }
 
+/**
+ * Safe public representation of a generation history record.
+ * Matches backend HistoryEntryResponse — ip_address and user_id are
+ * intentionally absent.
+ */
 export interface HistoryEntry {
   id: number;
   brand_name: string;
@@ -26,8 +36,6 @@ export interface HistoryEntry {
   generator: string;
   created_at: string;
   image_url: string;
-  user_id?: string | null;
-  ip_address?: string | null;
 }
 
 export interface LogoGenerationRequest {
@@ -41,4 +49,10 @@ export interface LogoGenerationRequest {
   elem_include?: string;
   elem_avoid?: string;
   mission?: string;
+}
+
+/** Response from POST /api/v1/ws/ticket — used by the frontend before opening a WebSocket. */
+export interface WsTicketResponse {
+  ticket: string;
+  expires_in: number;
 }

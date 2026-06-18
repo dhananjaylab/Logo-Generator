@@ -1,97 +1,62 @@
 /**
- * Authentication and API configuration utilities
- * Client-side only - runs in browser, not during SSR
+ * Authentication and API configuration utilities.
+ *
+ * SECURITY FIX (P1.1 / VULN-01):
+ * All localStorage-based token storage has been removed. Storing JWTs in
+ * localStorage exposes them to XSS attacks — any injected script (malicious
+ * npm package, browser extension, etc.) can read localStorage and exfiltrate
+ * the token.
+ *
+ * Tokens are now held exclusively in React component memory via AuthContext
+ * (src/contexts/AuthContext.tsx), which fetches them from a server-side
+ * Next.js API route (/api/auth/token) that reads server-only env vars.
+ *
+ * SECURITY FIX (P1.1 / VULN-01):
+ * NEXT_PUBLIC_DEV_TOKEN and NEXT_PUBLIC_JWT_TOKEN have been removed entirely.
+ * Public Next.js env vars are baked into the JavaScript bundle and served to
+ * every visitor, making any token value effectively public. Token provisioning
+ * now happens server-side only via /api/auth/token.
  */
 
 /**
- * Get authentication token from localStorage or environment
- * Uses DEV_TOKEN for development, expects Clerk token in production
- */
-export async function getAuthToken(): Promise<string> {
-  // Only run on client side
-  if (typeof window === 'undefined') {
-    throw new Error('getAuthToken() can only be called from the browser');
-  }
-
-  // Check if token is cached in localStorage
-  const cachedToken = localStorage.getItem('auth_token');
-  if (cachedToken) {
-    return cachedToken;
-  }
-
-  // For development, use the DEV_TOKEN from environment
-  const devToken = process.env.NEXT_PUBLIC_DEV_TOKEN;
-  if (devToken) {
-    localStorage.setItem('auth_token', devToken);
-    console.log('[Auth] Using DEV_TOKEN from environment');
-    return devToken;
-  }
-
-  // For production, expect a Clerk token
-  const clerkToken = process.env.NEXT_PUBLIC_JWT_TOKEN;
-  if (clerkToken) {
-    localStorage.setItem('auth_token', clerkToken);
-    return clerkToken;
-  }
-
-  throw new Error(
-    'No authentication token available. ' +
-    'Set NEXT_PUBLIC_DEV_TOKEN for development or NEXT_PUBLIC_JWT_TOKEN for production'
-  );
-}
-
-/**
- * Get the API base URL
+ * Get the REST API base URL.
+ * NEXT_PUBLIC_API_URL is safe to expose — it is an endpoint address, not a credential.
  */
 export function getApiUrl(): string {
-  const base = (process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8000').replace(/\/$/, '');
+  const base = (
+    process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8000'
+  ).replace(/\/$/, '');
   return base.endsWith('/api/v1') ? base : `${base}/api/v1`;
 }
 
 /**
- * Get the WebSocket URL for the API
+ * Derive the WebSocket URL from the API URL.
  */
 export function getWsUrl(): string {
   const apiUrl = getApiUrl();
-  // Convert http(s) to ws(s)
-  if (apiUrl.startsWith('https://')) {
-    return apiUrl.replace('https://', 'wss://');
-  }
-  if (apiUrl.startsWith('http://')) {
-    return apiUrl.replace('http://', 'ws://');
-  }
+  if (apiUrl.startsWith('https://')) return apiUrl.replace('https://', 'wss://');
+  if (apiUrl.startsWith('http://'))  return apiUrl.replace('http://', 'ws://');
   return apiUrl;
 }
 
 /**
- * Fetch with authentication header
- * Should be called from client-side code only
+ * Fetch wrapper that attaches the Authorization Bearer header.
+ *
+ * The `token` parameter is required and must come from AuthContext — there is
+ * no localStorage or env-var fallback. If token is null the request is sent
+ * without an Authorization header, which the backend will reject with 401.
  */
 export async function authenticatedFetch(
   url: string,
   options?: RequestInit,
-  token?: string | null
+  token?: string | null,
 ): Promise<Response> {
-  // Get token from parameter, localStorage, or environment
-  let authToken = token;
-  
-  if (!authToken && typeof window !== 'undefined') {
-    authToken = localStorage.getItem('auth_token');
-  }
-  
-  if (!authToken) {
-    authToken = process.env.NEXT_PUBLIC_DEV_TOKEN || process.env.NEXT_PUBLIC_JWT_TOKEN;
-  }
-
-  const headers = new Headers(options?.headers || {});
+  const headers = new Headers(options?.headers ?? {});
   headers.set('Content-Type', 'application/json');
 
-  if (authToken) {
-    headers.set('Authorization', `Bearer ${authToken}`);
+  if (token) {
+    headers.set('Authorization', `Bearer ${token}`);
   }
 
-  return fetch(url, {
-    ...options,
-    headers,
-  });
+  return fetch(url, { ...options, headers });
 }
