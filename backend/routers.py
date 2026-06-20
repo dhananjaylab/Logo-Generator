@@ -3,7 +3,9 @@ import json
 import os
 import secrets
 import logging
+from datetime import datetime, timezone
 from typing import List
+
 from fastapi import APIRouter, HTTPException, Depends, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import JSONResponse
 from sqlalchemy import select, desc, text
@@ -19,35 +21,37 @@ from models import (
     HistoryEntryResponse,
     WsTicketResponse,
 )
-from services import LLMService
 from database import get_db, LogoGeneration
 from dependencies import get_gemini_client, get_openai_client, Clients, validate_clerk_token
 from config import LOGO_STYLES, COLOR_PALETTES, SUPPORTED_GENERATORS
 from limiter import limiter
 from prom_metrics import queue_depth, component_ready
-from utils import anonymise_ip  # P1.4
+from utils import anonymise_ip   # P1.4
 
 router = APIRouter(prefix="/api/v1", tags=["logo"])
 logger = logging.getLogger(__name__)
 
-_ROUTE_TIMEOUT = 90
+# Job result TTL matches worker result_ttl (2 days in seconds).
+# The queue-mapping key must live at least as long as the result so status
+# lookups never fail while a result is still retrievable.
+_JOB_QUEUE_KEY_TTL = 172_800   # 2 days
+
+# Per-user daily quota; override via USER_DAILY_QUOTA env var.
+_USER_DAILY_QUOTA = int(os.getenv("USER_DAILY_QUOTA", "50"))
 
 
 async def get_redis(request: Request):
-    """Dependency to get ARQ redis pool from app state (created at startup)."""
+    """Dependency: return ARQ redis pool or raise 503 if unavailable."""
     redis = getattr(request.app.state, "redis", None)
     if redis is None:
         raise HTTPException(503, "Queue service temporarily unavailable")
     return redis
 
 
-# ── Health ──────────────────────────────────────────────────────────────────
+# ── Health ────────────────────────────────────────────────────────────────────
 
 @router.get("/health", response_model=HealthResponse)
-async def health_check(
-    redis=Depends(get_redis),
-    db=Depends(get_db),
-):
+async def health_check(redis=Depends(get_redis), db=Depends(get_db)):
     health: dict = {
         "status": "ok",
         "gemini_ready": Clients.is_gemini_ready(),
@@ -55,7 +59,6 @@ async def health_check(
         "redis_ready": False,
         "db_ready": False,
     }
-
     if not health["gemini_ready"] or not health["openai_ready"]:
         health["status"] = "degraded"
 
@@ -82,11 +85,10 @@ async def health_check(
             component_ready.labels(component="db").set(0)
             logger.warning(f"[Health] DB probe failed: {exc}")
 
-    status_code = 200 if health["status"] == "ok" else 503
-    return JSONResponse(content=health, status_code=status_code)
+    return JSONResponse(content=health, status_code=200 if health["status"] == "ok" else 503)
 
 
-# ── Generate ─────────────────────────────────────────────────────────────────
+# ── Generate ──────────────────────────────────────────────────────────────────
 
 @router.post("/generate", response_model=LogoJobResponse)
 @limiter.limit(os.getenv("RATE_LIMIT_PER_MINUTE", "10/minute"))
@@ -96,19 +98,36 @@ async def generate_logo(
     request: Request,
     redis=Depends(get_redis),
     gemini_client: genai.Client = Depends(get_gemini_client),
-    openai_client: AsyncOpenAI = Depends(get_openai_client),
+    openai_client: AsyncOpenAI  = Depends(get_openai_client),
     user: dict = Depends(validate_clerk_token),
 ):
-    user_id = user.get("sub", "anonymous")
+    user_id  = user.get("sub", "anonymous")
+    raw_ip   = request.client.host if request.client else None
+    user_ip_hash = anonymise_ip(raw_ip)   # P1.4 — hash before any storage
 
-    # SECURITY FIX (P1.4 / VULN-04):
-    # Anonymise the IP address *before* it leaves this request handler.
-    # The raw IP is held only in the local variable below for the duration of
-    # this function; it is never written to Redis, the DB, or any log.
-    raw_ip = request.client.host if request.client else None
-    user_ip_hash = anonymise_ip(raw_ip)   # 16-char hex or None if salt unset
+    # ── P2.8: Per-user daily generation quota ─────────────────────────────
+    # This sits inside the authenticated endpoint so user_id is always known.
+    # The key format guarantees reset at UTC midnight; a 25-hour TTL covers
+    # users in UTC+14 whose "day" extends past UTC midnight.
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    quota_key = f"user_quota:{user_id}:{today}"
+    try:
+        daily_count = int(await redis.incr(quota_key) or 0)
+        await redis.expire(quota_key, 90_000)   # 25 h — covers timezone drift
+        if daily_count > _USER_DAILY_QUOTA:
+            logger.warning(f"[Quota] User {user_id} exceeded daily limit ({daily_count})")
+            raise HTTPException(
+                429,
+                f"Daily generation limit of {_USER_DAILY_QUOTA} reached. "
+                "Try again after midnight UTC.",
+            )
+    except HTTPException:
+        raise
+    except Exception as exc:
+        # Redis quota check failure must not block generation — log and continue.
+        logger.warning(f"[Quota] Redis quota check failed for {user_id}: {exc}")
 
-    logger.info(f"[API] Logo request from user: {user_id}")
+    logger.info(f"[API] Generation #{daily_count} today for user: {user_id}")
 
     # ── Validate ──────────────────────────────────────────────────────────
     if logo_request.generator == "gpt-image-2-2026-04-21":
@@ -119,8 +138,7 @@ async def generate_logo(
             raise HTTPException(500, "Gemini API client not initialised.")
     else:
         raise HTTPException(
-            400,
-            f"Invalid generator. Choose from: {', '.join(SUPPORTED_GENERATORS)}",
+            400, f"Invalid generator. Choose from: {', '.join(SUPPORTED_GENERATORS)}",
         )
 
     if logo_request.style not in LOGO_STYLES:
@@ -159,11 +177,17 @@ async def generate_logo(
 
     job = await redis.enqueue_job(
         function_name,
-        user_ip=user_ip_hash,   # anonymised hash — raw IP never stored in Redis
+        user_ip=user_ip_hash,
         user_id=user_id,
         _queue_name=queue_name,
         **common,
     )
+
+    # ── P2.2: Store job→queue mapping for O(1) status lookup ─────────────
+    # Without this, get_job_status() scans three queues sequentially (3 Redis
+    # round-trips). With this key, it resolves in one GET. The TTL matches the
+    # worker result_ttl so the key is always present while the result exists.
+    await redis.setex(f"job_queue:{job.job_id}", _JOB_QUEUE_KEY_TTL, queue_name)
 
     try:
         depth = await redis.llen(queue_name)
@@ -182,32 +206,52 @@ async def get_job_status(
     redis=Depends(get_redis),
     user: dict = Depends(validate_clerk_token),
 ):
-    """Check the status of a background job (requires authentication)."""
-    user_id = user.get("sub", "anonymous")
-    logger.info(f"[API] Job status request from user: {user_id}, job: {job_id}")
+    """
+    Check the status of a background job.
 
+    P2.2: Uses the job_queue:{job_id} Redis key set at enqueue time to
+    resolve which queue the job is on in a single GET, rather than probing
+    three queues sequentially (3 round-trips → 1 round-trip).
+    Falls back to the sequential scan for jobs enqueued before this change.
+    """
+    user_id = user.get("sub", "anonymous")
     from arq.jobs import Job
 
-    queues_to_search = ["openai_image_queue", "gemini_queue", "arq:queue"]
-    job_instance = None
-    status = "not_found"
-
     try:
-        for q in queues_to_search:
-            temp_job = Job(job_id, redis, _queue_name=q)
-            status = await temp_job.status()
-            if status != "not_found":
-                job_instance = temp_job
-                break
+        # ── Fast path: O(1) queue lookup via stored mapping ───────────────
+        stored_queue = await redis.get(f"job_queue:{job_id}")
+        if stored_queue:
+            queue_name = (
+                stored_queue.decode() if isinstance(stored_queue, bytes) else stored_queue
+            )
+            job_instance = Job(job_id, redis, _queue_name=queue_name)
+            status = await job_instance.status()
+            if status == "not_found":
+                # Mapping exists but job gone — clean up and fall through
+                await redis.delete(f"job_queue:{job_id}")
+                job_instance = None
+        else:
+            job_instance = None
+            status = "not_found"
+
+        # ── Slow path: legacy sequential scan (pre-P2.2 jobs) ────────────
+        if job_instance is None or status == "not_found":
+            for q in ["openai_image_queue", "gemini_queue", "arq:queue"]:
+                temp = Job(job_id, redis, _queue_name=q)
+                status = await temp.status()
+                if status != "not_found":
+                    job_instance = temp
+                    break
 
         if not job_instance or status == "not_found":
             raise HTTPException(404, f"Job {job_id} not found")
 
         result_info = await job_instance.result_info()
 
+        # Ownership check
         job_user_id = result_info.kwargs.get("user_id") if result_info else None
         if job_user_id and job_user_id != user_id and user_id != "developer":
-            logger.warning(f"[API] Job ownership check failed: {job_user_id} != {user_id}")
+            logger.warning(f"[API] Ownership check failed: {job_user_id} != {user_id}")
             raise HTTPException(403, "You don't have permission to access this job")
 
         if status == "complete" and result_info:
@@ -218,23 +262,23 @@ async def get_job_status(
                 "job_id": job_id,
                 "status": "completed",
                 "result": {
-                    "result": res_data.get("result"),
+                    "result":    res_data.get("result"),
                     "generator": res_data.get("generator"),
-                    "prompt": res_data.get("prompt"),
-                    "brand": result_info.kwargs.get("text"),
-                    "style": result_info.kwargs.get("style"),
-                    "palette": result_info.kwargs.get("palette"),
+                    "prompt":    res_data.get("prompt"),
+                    "brand":     result_info.kwargs.get("text"),
+                    "style":     result_info.kwargs.get("style"),
+                    "palette":   result_info.kwargs.get("palette"),
                 },
             }
-        else:
-            status_str = status.value if hasattr(status, "value") else str(status)
-            return {"job_id": job_id, "status": status_str}
+
+        status_str = status.value if hasattr(status, "value") else str(status)
+        return {"job_id": job_id, "status": status_str}
 
     except HTTPException:
         raise
-    except Exception as e:
-        logger.error(f"[API] Error fetching job status: {e}")
-        raise HTTPException(500, f"Error fetching job status: {e}")
+    except Exception as exc:
+        logger.error(f"[API] Error fetching job status: {exc}")
+        raise HTTPException(500, f"Error fetching job status: {exc}")
 
 
 # ── History ───────────────────────────────────────────────────────────────────
@@ -245,19 +289,10 @@ async def get_generation_history(
     db=Depends(get_db),
     user: dict = Depends(validate_clerk_token),
 ):
-    """
-    Retrieve the latest logo generation history for the authenticated user.
-
-    SECURITY FIX (P1.6): The response_model=List[HistoryEntryResponse] ensures
-    FastAPI serialises ONLY the whitelisted fields defined in HistoryEntryResponse.
-    ip_hash and user_id are never included in API responses.
-    """
+    """P1.6: response_model=HistoryEntryResponse excludes ip_hash and user_id."""
     user_id = user.get("sub", "anonymous")
-    logger.info(f"[API] History request from user: {user_id}")
-
     if not db:
         return []
-
     try:
         stmt = (
             select(LogoGeneration)
@@ -267,8 +302,8 @@ async def get_generation_history(
         )
         result = await db.execute(stmt)
         return result.scalars().all()
-    except Exception as e:
-        logger.error(f"[DB] Failed to fetch history: {e}")
+    except Exception as exc:
+        logger.error(f"[DB] Failed to fetch history: {exc}")
         return []
 
 
@@ -279,27 +314,10 @@ async def create_ws_ticket(
     user: dict = Depends(validate_clerk_token),
     redis=Depends(get_redis),
 ):
-    """
-    Exchange a long-lived JWT for a short-lived, single-use WebSocket ticket.
-
-    SECURITY FIX (P1.2 / VULN-02):
-    WebSocket connections pass their auth via URL query parameter, which gets
-    logged in plaintext by every reverse proxy and CDN. Sending the full JWT
-    there leaks a long-lived credential into access logs.
-
-    This endpoint issues a 30-second, single-use ticket stored in Redis.  The
-    client puts the ticket (not the JWT) in the WebSocket URL.  The WebSocket
-    handler consumes and deletes the ticket atomically, so it cannot be replayed.
-    """
-    ticket = secrets.token_urlsafe(32)
+    """P1.2: Exchange JWT for a 30-second single-use WebSocket ticket."""
+    ticket  = secrets.token_urlsafe(32)
     user_id = user.get("sub", "anonymous")
-
-    # Store with a 30-second TTL — long enough for the client to open the
-    # WebSocket immediately after obtaining it, short enough to be useless
-    # if intercepted from a log file.
     await redis.setex(f"ws_ticket:{ticket}", 30, user_id)
-    logger.debug(f"[WS Ticket] Issued ticket for user: {user_id}")
-
     return {"ticket": ticket, "expires_in": 30}
 
 
@@ -317,29 +335,17 @@ async def inspect_dlq(
     queue_name = queue if queue in {"dalle", "gemini"} else "dalle"
     limit = max(1, min(limit, 100))
     items = await redis.lrange(f"dlq:{queue_name}", 0, limit - 1)
-    decoded = []
-    for item in items:
-        if isinstance(item, bytes):
-            item = item.decode("utf-8")
-        decoded.append(json.loads(item))
-    return decoded
+    return [
+        json.loads(item.decode("utf-8") if isinstance(item, bytes) else item)
+        for item in items
+    ]
 
 
-# ── WebSocket Progress ─────────────────────────────────────────────────────────
+# ── WebSocket Progress ────────────────────────────────────────────────────────
 
 @router.websocket("/ws/progress/{job_id}")
 async def ws_progress(websocket: WebSocket, job_id: str):
-    """
-    WebSocket endpoint. Uses Redis Pub/Sub push instead of polling.
-
-    SECURITY FIX (P1.2 / VULN-02):
-    Authentication now uses a short-lived ticket issued by POST /ws/ticket
-    rather than the long-lived JWT.  The ticket is consumed atomically with
-    Redis GETDEL, making it single-use and preventing replay attacks even if
-    it appears in server logs during the 30-second validity window.
-
-    Query param:  ?ticket=<value>   (NOT ?token=<jwt>)
-    """
+    """P1.2: Ticket-based auth. P2.2: uses job_queue mapping for fast lookup."""
     from arq.jobs import Job
 
     redis = getattr(websocket.app.state, "redis", None)
@@ -347,37 +353,39 @@ async def ws_progress(websocket: WebSocket, job_id: str):
         await websocket.close(code=1011, reason="Service temporarily unavailable")
         return
 
-    # ── Ticket validation ─────────────────────────────────────────────────
+    # ── Ticket validation (P1.2) ──────────────────────────────────────────
     raw_ticket = websocket.query_params.get("ticket", "")
     if not raw_ticket:
         await websocket.close(code=1008, reason="Missing authentication ticket")
         return
 
-    # GETDEL is atomic: retrieves the value and deletes the key in one round-trip.
-    # This guarantees the ticket is single-use even under concurrent connections.
     user_id_bytes = await redis.getdel(f"ws_ticket:{raw_ticket}")
     if not user_id_bytes:
         await websocket.close(code=1008, reason="Invalid or expired ticket")
         return
 
     user_id = user_id_bytes.decode() if isinstance(user_id_bytes, bytes) else user_id_bytes
-    logger.debug(f"[WS] Ticket validated for user={user_id}, job={job_id}")
 
     await websocket.accept()
     channel = f"job:complete:{job_id}"
-    pubsub = None
+    pubsub  = None
 
     try:
-        # Subscribe FIRST to eliminate the race condition where the job completes
-        # between our status check and the subscribe call.
         pubsub = redis.pubsub()
         await pubsub.subscribe(channel)
 
-        # Check if the job already completed while we were subscribing.
+        # Check if job already completed while subscribing
         queues = ["openai_image_queue", "gemini_queue", "arq:queue"]
+
+        # P2.2: fast path — check queue mapping first
+        stored_queue = await redis.get(f"job_queue:{job_id}")
+        if stored_queue:
+            q_name = stored_queue.decode() if isinstance(stored_queue, bytes) else stored_queue
+            queues = [q_name] + [q for q in queues if q != q_name]
+
         for q in queues:
-            job_obj = Job(job_id, redis, _queue_name=q)
-            status = await job_obj.status()
+            job_obj    = Job(job_id, redis, _queue_name=q)
+            status     = await job_obj.status()
             status_str = status.value if hasattr(status, "value") else str(status)
             if status_str == "complete":
                 info = await job_obj.result_info()
@@ -393,12 +401,12 @@ async def ws_progress(websocket: WebSocket, job_id: str):
                         await websocket.send_json({
                             "status": "completed",
                             "result": {
-                                "result": res.get("result"),
+                                "result":    res.get("result"),
                                 "generator": res.get("generator"),
-                                "prompt": res.get("prompt"),
-                                "brand": info.kwargs.get("text"),
-                                "style": info.kwargs.get("style"),
-                                "palette": info.kwargs.get("palette"),
+                                "prompt":    res.get("prompt"),
+                                "brand":     info.kwargs.get("text"),
+                                "style":     info.kwargs.get("style"),
+                                "palette":   info.kwargs.get("palette"),
                             },
                         })
                 return
@@ -411,24 +419,21 @@ async def ws_progress(websocket: WebSocket, job_id: str):
                     if message["type"] != "message":
                         continue
                     data = json.loads(message["data"])
-
                     published_owner = data.pop("user_id", None)
                     if published_owner and published_owner != user_id and user_id != "developer":
                         await websocket.send_json({"status": "failed", "error": "Unauthorized"})
                         break
-
                     await websocket.send_json(data)
                     break
-
         except asyncio.TimeoutError:
             await websocket.send_json({"status": "failed", "error": "Job timed out"})
 
     except WebSocketDisconnect:
         logger.info(f"[WS] Client disconnected for job {job_id}")
-    except Exception as e:
-        logger.error(f"[WS] Unexpected error for job {job_id}: {e}")
+    except Exception as exc:
+        logger.error(f"[WS] Unexpected error for job {job_id}: {exc}")
         try:
-            await websocket.send_json({"status": "error", "error": str(e)})
+            await websocket.send_json({"status": "error", "error": str(exc)})
         except Exception:
             pass
     finally:
