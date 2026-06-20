@@ -10,6 +10,7 @@ from prom_metrics import generation_requests, generation_latency, errors_total, 
 from repository import LogoRepository
 from services import LLMService
 from dependencies import Clients
+from circuit_breaker import close_all as close_circuit_breakers  # P2 — cleanup
 
 logger = logging.getLogger(__name__)
 
@@ -69,7 +70,7 @@ async def generate_openai_image_task(ctx, user_ip: str, user_id: str, **kwargs):
         llm = LLMService(None, openai_client, repository=repo)
 
     job_id = ctx.get("job_id")
-    redis = ctx.get("redis")
+    redis  = ctx.get("redis")
     generation_requests.labels(generator="gpt-image-2-2026-04-21").inc()
     started = time.perf_counter()
 
@@ -84,13 +85,13 @@ async def generate_openai_image_task(ctx, user_ip: str, user_id: str, **kwargs):
                 "status": "completed",
                 "user_id": user_id,
                 "result": {
-                    "result": result["result"],
+                    "result":    result["result"],
                     "generator": result["generator"],
-                    "prompt": result["prompt"],
-                    "brand": kwargs.get("text", ""),
-                    "style": kwargs.get("style", ""),
-                    "palette": kwargs.get("palette", ""),
-                }
+                    "prompt":    result["prompt"],
+                    "brand":     kwargs.get("text"),
+                    "style":     kwargs.get("style"),
+                    "palette":   kwargs.get("palette"),
+                },
             })
             await redis.publish(f"job:complete:{job_id}", event)
 
@@ -126,19 +127,21 @@ async def startup(ctx):
 
 async def shutdown(ctx):
     logger.info("[OpenAI Image Worker] Shutting down...")
+    # P2 — close the dedicated Redis connections held by circuit breakers.
+    # Without this, the event loop would log "Task destroyed but it is pending"
+    # warnings and the connections would leak until the process exits.
+    await close_circuit_breakers()
+    logger.info("[OpenAI Image Worker] Circuit breaker connections closed")
 
 
 class WorkerSettings:
-    """
-    ARQ worker settings for OpenAI image generation.
-    Configures job result TTL (2 days) to prevent result accumulation.
-    """
-    functions = [generate_openai_image_task]
+    """ARQ worker settings for OpenAI image generation."""
+    functions   = [generate_openai_image_task]
     redis_settings = REDIS_SETTINGS
-    queue_name = 'openai_image_queue'
-    on_startup = startup
+    queue_name  = "openai_image_queue"
+    on_startup  = startup
     on_shutdown = shutdown
-    result_ttl = 172800  # 2 days in seconds: results auto-expire after 2 days
-    max_tries = int(os.getenv("DALLE_WORKER_MAX_TRIES", "3"))
+    result_ttl  = 172_800   # 2 days
+    max_tries   = int(os.getenv("DALLE_WORKER_MAX_TRIES", "3"))
     job_timeout = int(os.getenv("DALLE_WORKER_TIMEOUT", "100"))
-    max_jobs = int(os.getenv("DALLE_WORKER_MAX_JOBS", "5"))
+    max_jobs    = int(os.getenv("DALLE_WORKER_MAX_JOBS", "5"))

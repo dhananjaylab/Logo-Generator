@@ -4,7 +4,7 @@ import logging
 import os
 import time
 from datetime import datetime, timezone
-from arq import worker
+
 from google import genai
 
 from config import REDIS_URL, REDIS_SETTINGS
@@ -13,6 +13,7 @@ from prom_metrics import generation_requests, generation_latency, errors_total, 
 from repository import LogoRepository
 from services import LLMService
 from dependencies import Clients
+from circuit_breaker import close_all as close_circuit_breakers  # P2 — cleanup
 
 logger = logging.getLogger(__name__)
 
@@ -57,55 +58,58 @@ async def _handle_permanent_failure(ctx, user_id: str, error: Exception, queue_n
 def _is_final_attempt(ctx) -> bool:
     return _retry_count(ctx) + 1 >= WorkerSettings.max_tries
 
+
 async def generate_gemini_task(ctx, user_ip: str, user_id: str, **kwargs):
     """
     Background task to generate a logo using Gemini.
     Uses LLMService stored in ARQ context for connection reuse.
     Publishes completion event to Redis for WebSocket subscribers.
     """
-    # Try to get LLMService from context (reused), fallback to create new one
     llm = ctx.get("llm_gemini") if hasattr(ctx, "get") else None
-    
+
     if not llm:
         gemini_client = Clients.get_gemini_client()
         repo = LogoRepository(AsyncSessionLocal)
         llm = LLMService(gemini_client, None, repository=repo)
-    
+
     job_id = ctx.get("job_id")
-    redis = ctx.get("redis")
+    redis  = ctx.get("redis")
     generation_requests.labels(generator="gemini").inc()
     started = time.perf_counter()
 
     logger.info(f"[Gemini Worker] Starting generation for '{kwargs.get('text')}' (job={job_id})")
-    
+
     try:
         path, prompt = await llm.generate_logo_with_gemini(user_ip=user_ip, user_id=user_id, **kwargs)
         result = {"result": [path], "generator": "gemini", "prompt": prompt, "status": "completed"}
 
-        # Notify WebSocket subscribers — replaces server-side polling
         if job_id and redis:
             event = json.dumps({
                 "status": "completed",
-                "user_id": user_id,  # for ownership validation in WS handler
+                "user_id": user_id,
                 "result": {
-                    "result": result["result"],
+                    "result":    result["result"],
                     "generator": result["generator"],
-                    "prompt": result["prompt"],
-                    "brand": kwargs.get("text", ""),
-                    "style": kwargs.get("style", ""),
-                    "palette": kwargs.get("palette", ""),
-                }
+                    "prompt":    result["prompt"],
+                    "brand":     kwargs.get("text"),
+                    "style":     kwargs.get("style"),
+                    "palette":   kwargs.get("palette"),
+                },
             })
             await redis.publish(f"job:complete:{job_id}", event)
 
-        generation_latency.labels(generator="gemini", status="success").observe(time.perf_counter() - started)
+        generation_latency.labels(generator="gemini", status="success").observe(
+            time.perf_counter() - started
+        )
         return result
 
     except Exception as exc:
         logger.error(f"[Gemini Worker] Generation failed: {exc}")
         errors_total.labels(error_type=type(exc).__name__, source="gemini_worker").inc()
         job_retries_total.labels(generator="gemini", source="gemini_worker").inc()
-        generation_latency.labels(generator="gemini", status="failed").observe(time.perf_counter() - started)
+        generation_latency.labels(generator="gemini", status="failed").observe(
+            time.perf_counter() - started
+        )
         if _is_final_attempt(ctx):
             await _handle_permanent_failure(ctx, user_id, exc, "dlq:gemini", kwargs.get("text", ""))
             if job_id and redis:
@@ -115,28 +119,30 @@ async def generate_gemini_task(ctx, user_ip: str, user_id: str, **kwargs):
                 )
         raise
 
+
 async def startup(ctx):
     logger.info("[Gemini Worker] Starting up...")
     gemini_client = Clients.get_gemini_client()
-    # Store LLMService in context for reuse across tasks
     repo = LogoRepository(AsyncSessionLocal)
     ctx["llm_gemini"] = LLMService(gemini_client, None, repository=repo)
     worker_max_jobs.labels(queue="gemini_queue").set(WorkerSettings.max_jobs)
 
+
 async def shutdown(ctx):
     logger.info("[Gemini Worker] Shutting down...")
+    # P2 — close dedicated Redis connections held by circuit breakers.
+    await close_circuit_breakers()
+    logger.info("[Gemini Worker] Circuit breaker connections closed")
+
 
 class WorkerSettings:
-    """
-    ARQ worker settings for Gemini.
-    Configures job result TTL (2 days) to prevent result accumulation.
-    """
-    functions = [generate_gemini_task]
+    """ARQ worker settings for Gemini."""
+    functions   = [generate_gemini_task]
     redis_settings = REDIS_SETTINGS
-    queue_name = 'gemini_queue'
-    on_startup = startup
+    queue_name  = "gemini_queue"
+    on_startup  = startup
     on_shutdown = shutdown
-    result_ttl = 172800  # 2 days in seconds: results auto-expire after 2 days
-    max_tries = int(os.getenv("GEMINI_WORKER_MAX_TRIES", "3"))
+    result_ttl  = 172_800   # 2 days
+    max_tries   = int(os.getenv("GEMINI_WORKER_MAX_TRIES", "3"))
     job_timeout = int(os.getenv("GEMINI_WORKER_TIMEOUT", "60"))
-    max_jobs = int(os.getenv("GEMINI_WORKER_MAX_JOBS", "10"))
+    max_jobs    = int(os.getenv("GEMINI_WORKER_MAX_JOBS", "10"))
