@@ -1,25 +1,30 @@
 """
 services.py – Logo generation services.
 
-Phase 2 changes
-───────────────
-HIGH-02 FIX  R2 client is now a thread-local singleton (threading.local).
-             Previously get_r2_client() called boto3.client() on every upload,
-             paying a full TLS handshake each time. With thread-local storage
-             each thread in asyncio's thread-pool executor reuses its own
-             connection-pooled client across calls, while avoiding the
-             thread-safety issues of a single shared client.
+Phase 2 changes (carried forward)
+──────────────────────────────────
+HIGH-02  R2 client is a thread-local singleton (threading.local) — eliminates
+         a TLS handshake on every upload.
+MED-03   Image validation uses magic-byte prefix checking instead of PIL
+         decompression — no pixel-buffer allocation just to validate format.
+HIGH-04  Circuit breakers (dalle_cb, gemini_cb, r2_cb) use Redis-backed shared
+         state across all API and worker processes.
 
-MED-03 FIX   _decode_image_payload() no longer opens the image with PIL and
-             calls img.load() just to validate it. PIL decompresses the entire
-             JPEG/PNG into an RGBA pixel buffer (~12 MB for 1024×1024) which is
-             then immediately discarded. Magic-byte prefix checking validates
-             the format in microseconds with zero heap allocation.
-
-HIGH-04 FIX  Circuit breakers (dalle_cb, gemini_cb, r2_cb) are now imported
-             from the rewritten circuit_breaker.py which stores state in Redis,
-             giving all worker and API processes a shared, consistent view of
-             each provider's health. The call() interface is unchanged.
+Phase 3 changes (this revision)
+────────────────────────────────
+P3.6 (MED-02 fix)  LLMService.generate_logo_with_openai_image() and
+         generate_logo_with_gemini() now both accept a single
+         `LogoGenerationParams` dataclass instead of **kwargs. The Gemini
+         quota-fallback path forwards that same object unchanged to the
+         OpenAI path — no more manually-reconstructed `fallback_kwargs` dict
+         and no more risk of pop-order drift between the two methods.
+P3.2     Both generation methods now return a 3-tuple (url, prompt, cost_usd)
+         and pass cost_usd through to LogoRepository.save() for budget
+         tracking and the Grafana cost dashboard.
+P3.3/4   New `r2_key_from_url()` helper reverses the URL construction done in
+         upload_to_r2(), used by the GDPR deletion endpoint (routers.py) and
+         the data-retention purge cron job (maintenance_worker.py) to find
+         and remove the corresponding R2 object.
 """
 
 import base64
@@ -40,6 +45,7 @@ from openai import AsyncOpenAI
 from circuit_breaker import dalle_cb, gemini_cb, r2_cb
 from prom_metrics import errors_total, r2_upload_latency
 from utils import sanitize_filename
+from models import LogoGenerationParams
 from config import (
     R2_BUCKET_NAME,
     R2_ACCESS_KEY_ID,
@@ -47,6 +53,7 @@ from config import (
     R2_SESSION_TOKEN,
     R2_ENDPOINT_URL,
     R2_PUBLIC_DOMAIN,
+    GENERATION_COST_USD,
 )
 from repository import LogoRepository
 
@@ -55,9 +62,6 @@ from repository import LogoRepository
 # Cloudflare R2 / S3 Client  (HIGH-02 FIX)
 # ─────────────────────────────────────────────────────────────────────────────
 
-# Thread-local storage — each thread in asyncio's executor gets its own
-# boto3 client.  This eliminates the TLS-handshake-per-request cost while
-# remaining thread-safe (boto3 clients are NOT safe to share across threads).
 _r2_thread_local = threading.local()
 
 
@@ -65,12 +69,10 @@ def get_r2_client():
     """
     Return a thread-local R2 (S3-compatible) client, creating it on first use.
 
-    Why threading.local instead of a module-level singleton:
-      boto3.client instances are not thread-safe. asyncio.to_thread() dispatches
-      each upload to a worker thread from the default executor pool. Using a
-      single shared client across threads can cause connection corruption under
-      concurrent uploads. threading.local() gives each thread its own client
-      that is safely reused for every upload that lands on that thread.
+    boto3 clients are not thread-safe; threading.local() gives each thread in
+    asyncio's executor pool its own connection-pooled client, reused across
+    every upload that lands on that thread, eliminating a fresh TLS handshake
+    per request.
     """
     if not all([R2_ACCESS_KEY_ID, R2_SECRET_ACCESS_KEY, R2_ENDPOINT_URL]):
         return None
@@ -85,7 +87,7 @@ def get_r2_client():
             aws_session_token=R2_SESSION_TOKEN or None,
             config=Config(
                 signature_version="s3v4",
-                max_pool_connections=5,   # per thread; total = threads × 5
+                max_pool_connections=5,
                 connect_timeout=5,
                 read_timeout=30,
             ),
@@ -95,10 +97,7 @@ def get_r2_client():
 
 
 def upload_to_r2(data: bytes, filename: str, content_type: str = "image/png") -> str:
-    """
-    Upload bytes to R2. Raises RuntimeError on failure so the caller
-    (worker task) can mark the job as failed and surface a real error.
-    """
+    """Upload bytes to R2. Raises RuntimeError on failure."""
     client = get_r2_client()
     if not client or not R2_BUCKET_NAME:
         raise RuntimeError(
@@ -115,8 +114,7 @@ def upload_to_r2(data: bytes, filename: str, content_type: str = "image/png") ->
             ContentType=content_type,
         )
     except Exception as exc:
-        elapsed = time.perf_counter() - started
-        r2_upload_latency.labels(status="failed").observe(elapsed)
+        r2_upload_latency.labels(status="failed").observe(time.perf_counter() - started)
         errors_total.labels(error_type=type(exc).__name__, source="r2").inc()
         message = str(exc)
         if "Unauthorized" in message or "401" in message:
@@ -127,11 +125,34 @@ def upload_to_r2(data: bytes, filename: str, content_type: str = "image/png") ->
             )
         raise RuntimeError(f"R2 upload failed for '{filename}': {message}") from exc
     else:
-        elapsed = time.perf_counter() - started
-        r2_upload_latency.labels(status="success").observe(elapsed)
+        r2_upload_latency.labels(status="success").observe(time.perf_counter() - started)
         if R2_PUBLIC_DOMAIN:
             return f"{R2_PUBLIC_DOMAIN}/{filename}"
         return f"{R2_ENDPOINT_URL}/{R2_BUCKET_NAME}/{filename}"
+
+
+def r2_key_from_url(url: str) -> Optional[str]:
+    """
+    P3.3/P3.4 — Reverse of the URL construction in upload_to_r2(): given a
+    stored image_url, return the R2 object key, or None if the URL doesn't
+    match either format we generate (public CDN domain, or raw R2 endpoint).
+
+    Used by:
+      - DELETE /api/v1/me/data (routers.py) — GDPR/CCPA erasure
+      - maintenance_worker.purge_expired_generations() — retention purge
+    """
+    if not url:
+        return None
+
+    if R2_PUBLIC_DOMAIN and url.startswith(R2_PUBLIC_DOMAIN):
+        return url[len(R2_PUBLIC_DOMAIN):].lstrip("/")
+
+    if R2_ENDPOINT_URL and R2_BUCKET_NAME:
+        prefix = f"{R2_ENDPOINT_URL}/{R2_BUCKET_NAME}/"
+        if url.startswith(prefix):
+            return url[len(prefix):]
+
+    return None
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -142,6 +163,28 @@ def _unique_filename(brand: str, generator: str, variation_index: int) -> str:
     ts   = int(time.time())
     safe = sanitize_filename(brand.replace(" ", "_") or "logo")
     return f"{generator}_{safe}_{ts}_v{variation_index}.png"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Cost Estimation  (P3.2)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _estimate_cost_usd(generator: str) -> float:
+    """
+    Rough per-generation cost estimate, used to populate cost_usd on each
+    saved record and to feed the Grafana cost dashboard / budget alerts.
+    Not penny-accurate billing — see config.GENERATION_COST_USD for notes.
+    """
+    if generator == "gpt-image-2-2026-04-21":
+        quality = os.getenv("OPENAI_IMAGE_QUALITY", "low")
+        table = GENERATION_COST_USD.get(generator, {})
+        return table.get(quality, 0.04) if isinstance(table, dict) else 0.04
+
+    if generator == "gemini":
+        cost = GENERATION_COST_USD.get("gemini", 0.02)
+        return cost if isinstance(cost, (int, float)) else 0.02
+
+    return 0.0
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -207,29 +250,20 @@ def build_logo_prompt(
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Image Validation  (MED-03 FIX)
+# Image Validation  (MED-03)
 # ─────────────────────────────────────────────────────────────────────────────
 
-# Known magic-byte prefixes for image formats we accept.
 _MAGIC_BYTES: dict[str, bytes] = {
     "jpeg": b"\xff\xd8\xff",
     "png":  b"\x89PNG",
-    "webp": b"RIFF",   # full header is RIFF????WEBP but first 4 bytes suffice
+    "webp": b"RIFF",
     "gif":  b"GIF8",
 }
 _MIN_MAGIC_LEN = max(len(m) for m in _MAGIC_BYTES.values())
 
 
 def _validate_image_bytes(data: bytes) -> str:
-    """
-    Validate image bytes by checking magic-byte prefixes.
-
-    Returns the detected format name, or raises ValueError.
-
-    MED-03: replaces the previous PIL-based validation which opened the image,
-    decoded every pixel into an RGBA buffer (~12 MB for 1024×1024), and then
-    discarded the result. Magic-byte checking is O(1) with zero heap allocation.
-    """
+    """Validate image bytes via magic-byte prefix. Returns format name or raises."""
     if len(data) < _MIN_MAGIC_LEN:
         raise ValueError(f"Image data too short ({len(data)} bytes) to be a valid image")
 
@@ -238,9 +272,8 @@ def _validate_image_bytes(data: bytes) -> str:
             return fmt
 
     raise ValueError(
-        f"Unrecognised image format. "
-        f"Magic bytes: {data[:8].hex()} — expected JPEG (ffd8ff), PNG (89504e47), "
-        f"WebP (52494646), or GIF (47494638)."
+        f"Unrecognised image format. Magic bytes: {data[:8].hex()} — "
+        f"expected JPEG (ffd8ff), PNG (89504e47), WebP (52494646), or GIF (47494638)."
     )
 
 
@@ -321,7 +354,6 @@ class GeminiService:
             for part in response_parts:
                 inline = getattr(part, "inline_data", None)
                 if inline and getattr(inline, "data", None):
-                    # Validate format with magic bytes before uploading
                     try:
                         fmt = _validate_image_bytes(inline.data)
                         print(f"[Gemini] Detected format: {fmt}")
@@ -356,15 +388,7 @@ _OPENAI_IMAGE_COMPRESSION = int(os.getenv("OPENAI_IMAGE_COMPRESSION", "85"))
 
 
 def _decode_image_payload(b64_json: str) -> bytes:
-    """
-    Decode a base64 image payload from the OpenAI API and validate its format.
-
-    MED-03: The previous implementation opened the image with PIL and called
-    img.load() to validate it. For a 1024×1024 JPEG this allocated ~12 MB of
-    pixel buffer just to confirm the image was valid, then threw it away.
-    We now validate with _validate_image_bytes() (magic-byte prefix check)
-    which is O(1) and allocates nothing beyond the already-decoded bytes.
-    """
+    """Decode + validate (magic bytes, MED-03) a base64 image payload."""
     if not b64_json:
         raise ValueError("OpenAI image response did not include image data")
 
@@ -373,9 +397,7 @@ def _decode_image_payload(b64_json: str) -> bytes:
     except (binascii.Error, ValueError) as exc:
         raise ValueError(f"Failed to base64-decode image payload: {exc}") from exc
 
-    # Validate format using magic bytes — no PIL, no pixel decompression
     _validate_image_bytes(image_bytes)
-
     return image_bytes
 
 
@@ -428,7 +450,7 @@ class OpenAIImageService:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Unified LLMService facade
+# Unified LLMService facade  (P3.6 — dataclass-based interface)
 # ─────────────────────────────────────────────────────────────────────────────
 
 class LLMService:
@@ -440,7 +462,7 @@ class LLMService:
     ):
         self.gemini       = GeminiService(gemini_client) if gemini_client else None
         self.openai_image = OpenAIImageService(openai_client) if openai_client else None
-        self._repo        = repository
+        self._repo         = repository
 
     @staticmethod
     def _is_gemini_quota_error(exc: Exception) -> bool:
@@ -453,97 +475,81 @@ class LLMService:
         )
 
     async def generate_logo_with_openai_image(
-        self, user_ip: Optional[str] = None, **kwargs
-    ) -> Tuple[str, str]:
-        user_id         = kwargs.pop("user_id", None)
-        variation_index = kwargs.pop("variation_index", 0)
-        text                = kwargs.pop("text", "logo")
-        description         = kwargs.pop("description", "")
-        style               = kwargs.pop("style", "minimalist")
-        palette             = kwargs.pop("palette", "monochrome")
-        tagline             = kwargs.pop("tagline", "")
-        typography          = kwargs.pop("typography", "")
-        elements_to_include = kwargs.pop("elements_to_include", "")
-        elements_to_avoid   = kwargs.pop("elements_to_avoid", "")
-        brand_mission       = kwargs.pop("brand_mission", "")
-        variation_hint      = kwargs.pop("variation_hint", "")
-
-        if kwargs:
-            print(f"[OpenAI Image] ⚠ Unexpected kwargs: {list(kwargs.keys())}")
-
+        self,
+        params: LogoGenerationParams,
+        user_id: Optional[str] = None,
+        user_ip: Optional[str] = None,   # already an ip_hash by the time it reaches here
+    ) -> Tuple[str, str, float]:
+        """Returns (image_url, prompt, cost_usd)."""
         prompt = build_logo_prompt(
-            text=text, description=description, style=style, palette=palette,
-            tagline=tagline, typography=typography,
-            elements_to_include=elements_to_include,
-            elements_to_avoid=elements_to_avoid,
-            brand_mission=brand_mission, variation_hint=variation_hint,
-            variation_index=variation_index,
+            text=params.text,
+            description=params.description,
+            style=params.style,
+            palette=params.palette,
+            tagline=params.tagline,
+            typography=params.typography,
+            elements_to_include=params.elements_to_include,
+            elements_to_avoid=params.elements_to_avoid,
+            brand_mission=params.brand_mission,
+            variation_hint=params.variation_hint,
+            variation_index=params.variation_index,
         )
 
         if not self.openai_image:
             raise RuntimeError("OpenAI image client is not configured.")
 
         local_path = await self.openai_image.generate_logo(
-            prompt, brand=text, variation_index=variation_index
+            prompt, brand=params.text, variation_index=params.variation_index
         )
+        cost = _estimate_cost_usd("gpt-image-2-2026-04-21")
 
         if self._repo:
             await self._repo.save(
-                text, prompt, "gpt-image-2-2026-04-21", local_path, user_id, user_ip,
+                params.text, prompt, "gpt-image-2-2026-04-21", local_path,
+                user_id, user_ip, cost_usd=cost,
             )
 
-        return local_path, prompt
+        return local_path, prompt, cost
 
     async def generate_logo_with_gemini(
-        self, user_ip: Optional[str] = None, **kwargs
-    ) -> Tuple[str, str]:
-        user_id         = kwargs.pop("user_id", None)
-        variation_index = kwargs.pop("variation_index", 0)
-        text                = kwargs.pop("text", "logo")
-        description         = kwargs.pop("description", "")
-        style               = kwargs.pop("style", "minimalist")
-        palette             = kwargs.pop("palette", "monochrome")
-        tagline             = kwargs.pop("tagline", "")
-        typography          = kwargs.pop("typography", "")
-        elements_to_include = kwargs.pop("elements_to_include", "")
-        elements_to_avoid   = kwargs.pop("elements_to_avoid", "")
-        brand_mission       = kwargs.pop("brand_mission", "")
-        variation_hint      = kwargs.pop("variation_hint", "")
-
-        if kwargs:
-            print(f"[Gemini] ⚠ Unexpected kwargs: {list(kwargs.keys())}")
-
-        fallback_kwargs = dict(
-            text=text, description=description, style=style, palette=palette,
-            tagline=tagline, typography=typography,
-            elements_to_include=elements_to_include,
-            elements_to_avoid=elements_to_avoid,
-            brand_mission=brand_mission, variation_hint=variation_hint,
-            variation_index=variation_index, user_id=user_id,
-        )
-
+        self,
+        params: LogoGenerationParams,
+        user_id: Optional[str] = None,
+        user_ip: Optional[str] = None,
+    ) -> Tuple[str, str, float]:
+        """Returns (image_url, prompt, cost_usd)."""
         try:
             if not self.gemini:
                 raise RuntimeError("Gemini client is not configured.")
 
             url, prompt = await self.gemini.generate_logo(
-                text=text, description=description, style=style, palette=palette,
-                tagline=tagline, typography=typography,
-                elements_to_include=elements_to_include,
-                elements_to_avoid=elements_to_avoid,
-                brand_mission=brand_mission, variation_hint=variation_hint,
-                variation_index=variation_index,
+                text=params.text,
+                description=params.description,
+                style=params.style,
+                palette=params.palette,
+                tagline=params.tagline,
+                typography=params.typography,
+                elements_to_include=params.elements_to_include,
+                elements_to_avoid=params.elements_to_avoid,
+                brand_mission=params.brand_mission,
+                variation_hint=params.variation_hint,
+                variation_index=params.variation_index,
             )
         except Exception as exc:
             if self._is_gemini_quota_error(exc):
                 print("[Gemini] ⚠ Quota exhausted; falling back to GPT image generation")
-                url, prompt = await self.generate_logo_with_openai_image(
-                    user_ip=user_ip, **fallback_kwargs
+                # P3.6 — `params` is forwarded unchanged. No manual kwargs
+                # reconstruction, no risk of pop-order drift between paths.
+                return await self.generate_logo_with_openai_image(
+                    params, user_id=user_id, user_ip=user_ip
                 )
-                return url, prompt
             raise
 
-        if self._repo:
-            await self._repo.save(text, prompt, "gemini", url, user_id, user_ip)
+        cost = _estimate_cost_usd("gemini")
 
-        return url, prompt
+        if self._repo:
+            await self._repo.save(
+                params.text, prompt, "gemini", url, user_id, user_ip, cost_usd=cost,
+            )
+
+        return url, prompt, cost

@@ -20,20 +20,23 @@ from models import (
     JobStatusResponse,
     HistoryEntryResponse,
     WsTicketResponse,
+    DataDeletionResponse,
 )
-from database import get_db, LogoGeneration
+from database import get_db, LogoGeneration, AsyncSessionLocal
 from dependencies import get_gemini_client, get_openai_client, Clients, validate_clerk_token
-from config import LOGO_STYLES, COLOR_PALETTES, SUPPORTED_GENERATORS
+from config import LOGO_STYLES, COLOR_PALETTES, SUPPORTED_GENERATORS, R2_BUCKET_NAME
 from limiter import limiter
-from prom_metrics import queue_depth, component_ready
-from utils import anonymise_ip   # P1.4
+from prom_metrics import queue_depth, component_ready, moderation_blocked_total
+from utils import anonymise_ip            # P1.4
+from moderation import moderate_text       # P3.1 — HIGH-05 fix
+from repository import LogoRepository, AuditRepository   # P3.4
+from services import get_r2_client, r2_key_from_url       # P3.3
 
 router = APIRouter(prefix="/api/v1", tags=["logo"])
 logger = logging.getLogger(__name__)
 
-# Job result TTL matches worker result_ttl (2 days in seconds).
-# The queue-mapping key must live at least as long as the result so status
-# lookups never fail while a result is still retrievable.
+# Job result TTL matches worker result_ttl (2 days in seconds). The
+# queue-mapping key must live at least as long as the result.
 _JOB_QUEUE_KEY_TTL = 172_800   # 2 days
 
 # Per-user daily quota; override via USER_DAILY_QUOTA env var.
@@ -101,21 +104,21 @@ async def generate_logo(
     openai_client: AsyncOpenAI  = Depends(get_openai_client),
     user: dict = Depends(validate_clerk_token),
 ):
-    user_id  = user.get("sub", "anonymous")
-    raw_ip   = request.client.host if request.client else None
+    user_id      = user.get("sub", "anonymous")
+    raw_ip       = request.client.host if request.client else None
     user_ip_hash = anonymise_ip(raw_ip)   # P1.4 — hash before any storage
 
+    audit = AuditRepository(AsyncSessionLocal)   # P3.4
+
     # ── P2.8: Per-user daily generation quota ─────────────────────────────
-    # This sits inside the authenticated endpoint so user_id is always known.
-    # The key format guarantees reset at UTC midnight; a 25-hour TTL covers
-    # users in UTC+14 whose "day" extends past UTC midnight.
     today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     quota_key = f"user_quota:{user_id}:{today}"
+    daily_count = 0
     try:
         daily_count = int(await redis.incr(quota_key) or 0)
-        await redis.expire(quota_key, 90_000)   # 25 h — covers timezone drift
+        await redis.expire(quota_key, 90_000)   # 25h — covers timezone drift
         if daily_count > _USER_DAILY_QUOTA:
-            logger.warning(f"[Quota] User {user_id} exceeded daily limit ({daily_count})")
+            logger.warning(f"[Quota] User exceeded daily limit ({daily_count})")
             raise HTTPException(
                 429,
                 f"Daily generation limit of {_USER_DAILY_QUOTA} reached. "
@@ -124,10 +127,7 @@ async def generate_logo(
     except HTTPException:
         raise
     except Exception as exc:
-        # Redis quota check failure must not block generation — log and continue.
-        logger.warning(f"[Quota] Redis quota check failed for {user_id}: {exc}")
-
-    logger.info(f"[API] Generation #{daily_count} today for user: {user_id}")
+        logger.warning(f"[Quota] Redis quota check failed: {exc}")
 
     # ── Validate ──────────────────────────────────────────────────────────
     if logo_request.generator == "gpt-image-2-2026-04-21":
@@ -147,6 +147,42 @@ async def generate_logo(
         raise HTTPException(400, f"Invalid palette. Choose from: {', '.join(COLOR_PALETTES.keys())}")
     if not logo_request.text and not logo_request.description:
         raise HTTPException(400, "Provide at least a brand name or description.")
+
+    # ── P3.1 (HIGH-05): Content moderation on all user-controlled free text ──
+    # Moderates the concatenation of every free-text field the user controls,
+    # BEFORE a job is enqueued. This blocks adversarial prompt injection
+    # instantly, with zero provider cost incurred, rather than letting a
+    # flagged request consume a worker slot and fail later.
+    combined_text = " ".join(filter(None, [
+        logo_request.text,
+        logo_request.description,
+        logo_request.tagline,
+        logo_request.brand_mission,
+        logo_request.elements_to_include,
+        logo_request.elements_to_avoid,
+        logo_request.variation_hint,
+    ]))
+    moderation = await moderate_text(combined_text)
+
+    if moderation.flagged:
+        for category in (moderation.categories or ["unspecified"]):
+            moderation_blocked_total.labels(category=category).inc()
+
+        await audit.log(
+            event_type="generation_blocked",
+            user_id=user_id,
+            ip_hash=user_ip_hash,
+            brand_name=logo_request.text,
+            generator=logo_request.generator,
+            moderation_flagged=True,
+            moderation_categories=",".join(moderation.categories),
+        )
+        raise HTTPException(
+            400,
+            "Your request was flagged by our content safety system "
+            f"({', '.join(moderation.categories) or 'policy violation'}). "
+            "Please revise your brand description and try again.",
+        )
 
     variation_index = getattr(logo_request, "variation_index", 0) or 0
 
@@ -183,11 +219,19 @@ async def generate_logo(
         **common,
     )
 
-    # ── P2.2: Store job→queue mapping for O(1) status lookup ─────────────
-    # Without this, get_job_status() scans three queues sequentially (3 Redis
-    # round-trips). With this key, it resolves in one GET. The TTL matches the
-    # worker result_ttl so the key is always present while the result exists.
+    # P2.2: job→queue mapping for O(1) status lookup
     await redis.setex(f"job_queue:{job.job_id}", _JOB_QUEUE_KEY_TTL, queue_name)
+
+    # P3.4: audit the accepted request (moderation already passed at this point)
+    await audit.log(
+        event_type="generation_requested",
+        user_id=user_id,
+        ip_hash=user_ip_hash,
+        brand_name=logo_request.text,
+        generator=logo_request.generator,
+        moderation_flagged=False,
+        detail=f"job_id={job.job_id} daily_count={daily_count}",
+    )
 
     try:
         depth = await redis.llen(queue_name)
@@ -210,31 +254,25 @@ async def get_job_status(
     Check the status of a background job.
 
     P2.2: Uses the job_queue:{job_id} Redis key set at enqueue time to
-    resolve which queue the job is on in a single GET, rather than probing
-    three queues sequentially (3 round-trips → 1 round-trip).
-    Falls back to the sequential scan for jobs enqueued before this change.
+    resolve which queue the job is on in a single GET, falling back to the
+    sequential 3-queue scan for jobs enqueued before this change.
     """
     user_id = user.get("sub", "anonymous")
     from arq.jobs import Job
 
     try:
-        # ── Fast path: O(1) queue lookup via stored mapping ───────────────
         stored_queue = await redis.get(f"job_queue:{job_id}")
         if stored_queue:
-            queue_name = (
-                stored_queue.decode() if isinstance(stored_queue, bytes) else stored_queue
-            )
+            queue_name = stored_queue.decode() if isinstance(stored_queue, bytes) else stored_queue
             job_instance = Job(job_id, redis, _queue_name=queue_name)
             status = await job_instance.status()
             if status == "not_found":
-                # Mapping exists but job gone — clean up and fall through
                 await redis.delete(f"job_queue:{job_id}")
                 job_instance = None
         else:
             job_instance = None
             status = "not_found"
 
-        # ── Slow path: legacy sequential scan (pre-P2.2 jobs) ────────────
         if job_instance is None or status == "not_found":
             for q in ["openai_image_queue", "gemini_queue", "arq:queue"]:
                 temp = Job(job_id, redis, _queue_name=q)
@@ -248,10 +286,9 @@ async def get_job_status(
 
         result_info = await job_instance.result_info()
 
-        # Ownership check
         job_user_id = result_info.kwargs.get("user_id") if result_info else None
         if job_user_id and job_user_id != user_id and user_id != "developer":
-            logger.warning(f"[API] Ownership check failed: {job_user_id} != {user_id}")
+            logger.warning("[API] Job ownership check failed")
             raise HTTPException(403, "You don't have permission to access this job")
 
         if status == "complete" and result_info:
@@ -289,7 +326,7 @@ async def get_generation_history(
     db=Depends(get_db),
     user: dict = Depends(validate_clerk_token),
 ):
-    """P1.6: response_model=HistoryEntryResponse excludes ip_hash and user_id."""
+    """P1.6: response_model=HistoryEntryResponse excludes ip_hash/user_id/cost_usd."""
     user_id = user.get("sub", "anonymous")
     if not db:
         return []
@@ -305,6 +342,59 @@ async def get_generation_history(
     except Exception as exc:
         logger.error(f"[DB] Failed to fetch history: {exc}")
         return []
+
+
+# ── GDPR / CCPA Data Deletion ──────────────────────────────────────────────────
+
+@router.delete("/me/data", response_model=DataDeletionResponse)
+async def delete_my_data(user: dict = Depends(validate_clerk_token)):
+    """
+    P3.3 — GDPR Article 17 / CCPA right-to-deletion endpoint.
+
+    Hard-deletes every LogoGeneration row owned by the authenticated user
+    and best-effort removes the corresponding image objects from R2.
+    AuditLog rows are anonymised (user_id → 'deleted-user' sentinel) rather
+    than deleted — see AuditRepository.anonymise_user() for the rationale.
+    """
+    user_id = user.get("sub", "anonymous")
+    if user_id == "anonymous":
+        raise HTTPException(400, "Cannot delete data for an unauthenticated session.")
+
+    repo  = LogoRepository(AsyncSessionLocal)
+    audit = AuditRepository(AsyncSessionLocal)
+
+    deleted_urls = await repo.delete_for_user(user_id)
+
+    deleted_images = 0
+    client = get_r2_client()
+    if client and R2_BUCKET_NAME:
+        for url in deleted_urls:
+            key = r2_key_from_url(url)
+            if not key:
+                continue
+            try:
+                client.delete_object(Bucket=R2_BUCKET_NAME, Key=key)
+                deleted_images += 1
+            except Exception as exc:
+                logger.warning(f"[GDPR] Failed to delete R2 object {key}: {exc}")
+
+    await audit.anonymise_user(user_id)
+    await audit.log(
+        event_type="data_deletion_requested",
+        user_id="deleted-user",
+        detail=f"deleted_generations={len(deleted_urls)} deleted_images={deleted_images}",
+    )
+
+    logger.info(
+        f"[GDPR] Deleted {len(deleted_urls)} generation(s), "
+        f"{deleted_images} R2 object(s) for a user-initiated erasure request"
+    )
+
+    return {
+        "deleted_generations": len(deleted_urls),
+        "deleted_images": deleted_images,
+        "message": "Your generation history and associated images have been permanently deleted.",
+    }
 
 
 # ── WebSocket Ticket ──────────────────────────────────────────────────────────
@@ -353,7 +443,6 @@ async def ws_progress(websocket: WebSocket, job_id: str):
         await websocket.close(code=1011, reason="Service temporarily unavailable")
         return
 
-    # ── Ticket validation (P1.2) ──────────────────────────────────────────
     raw_ticket = websocket.query_params.get("ticket", "")
     if not raw_ticket:
         await websocket.close(code=1008, reason="Missing authentication ticket")
@@ -374,10 +463,7 @@ async def ws_progress(websocket: WebSocket, job_id: str):
         pubsub = redis.pubsub()
         await pubsub.subscribe(channel)
 
-        # Check if job already completed while subscribing
         queues = ["openai_image_queue", "gemini_queue", "arq:queue"]
-
-        # P2.2: fast path — check queue mapping first
         stored_queue = await redis.get(f"job_queue:{job_id}")
         if stored_queue:
             q_name = stored_queue.decode() if isinstance(stored_queue, bytes) else stored_queue
