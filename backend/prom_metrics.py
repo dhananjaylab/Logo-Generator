@@ -105,3 +105,21 @@ errors_total = Counter(
     "Total errors by type and source",
     ["error_type", "source"],
 )
+
+# P3.2 — Cumulative estimated spend, by generator. Powers the Grafana cost
+# dashboard panel and can be used for budget alerting (e.g. alert when the
+# 24h rate of increase exceeds a threshold).
+generation_cost_usd_total = Counter(
+    "logoforge_generation_cost_usd_total",
+    "Cumulative estimated generation cost in USD",
+    ["generator"],
+)
+
+# P3.1 — Count of generation requests blocked by the content-moderation check,
+# broken out by category so operators can spot patterns (e.g. a spike in one
+# category may indicate a coordinated abuse attempt).
+moderation_blocked_total = Counter(
+    "logoforge_moderation_blocked_total",
+    "Total generation requests blocked by content moderation",
+    ["category"],
+)
