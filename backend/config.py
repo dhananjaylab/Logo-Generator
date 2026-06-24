@@ -70,3 +70,29 @@ GEMINI_GENERATION_TEMPLATE = (
     "The logo should be clean, vector-ready, and suitable for professional use. "
     "Ensure a white or transparent background."
 )
+
+# ─────────────────────────────────────────────────────────────────────────────
+# P3.2 — Cost Tracking
+# ─────────────────────────────────────────────────────────────────────────────
+# Approximate per-generation cost in USD, used to populate cost_usd on each
+# LogoGeneration row and to drive the Grafana cost dashboard / budget alerts.
+# These are illustrative estimates — update to match your actual negotiated
+# provider pricing. They are intentionally simple (no token-counting) since
+# the goal is budget visibility, not penny-accurate billing reconciliation.
+GENERATION_COST_USD = {
+    "gpt-image-2-2026-04-21": {
+        "low": 0.04,
+        "medium": 0.08,
+        "high": 0.12,
+    },
+    "gemini": 0.02,  # flat estimate for gemini-2.5-flash-image
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# P3.3 — Data Retention
+# ─────────────────────────────────────────────────────────────────────────────
+# Default retention window (in days) for generation history. The maintenance
+# worker's daily cron job (see maintenance_worker.py) permanently deletes any
+# LogoGeneration row — and its associated R2 image — older than this window,
+# satisfying the GDPR Article 5(1)(e) storage-limitation principle.
+DATA_RETENTION_DAYS = int(os.getenv("DATA_RETENTION_DAYS", "365"))
