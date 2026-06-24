@@ -1,7 +1,7 @@
 import os
 from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession, async_sessionmaker
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
-from sqlalchemy import String, Text, DateTime, func, event
+from sqlalchemy import String, Text, DateTime, Float, Boolean, func, event
 from datetime import datetime
 from typing import Optional
 from dotenv import load_dotenv
@@ -66,7 +66,45 @@ class LogoGeneration(Base):
     prompt: Mapped[str] = mapped_column(Text)
     generator: Mapped[str] = mapped_column(String(50))
     image_url: Mapped[str] = mapped_column(Text)
+
+    # P3.2 — Estimated cost in USD for this generation (see config.GENERATION_COST_USD).
+    # Nullable so historical rows created before this column existed remain valid.
+    cost_usd: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+
     created_at: Mapped[datetime] = mapped_column(DateTime, default=func.now())
+
+
+class AuditLog(Base):
+    """
+    P3.4 — Application-level audit trail for AI generation events and
+    privacy-relevant actions (data deletion, retention purges).
+
+    This is "tamper-evident by convention" rather than cryptographically
+    tamper-proof: rows are only ever inserted or have user_id anonymised,
+    never deleted by application code (except by direct DBA action). It
+    satisfies Harvard checklist F19 (logging/audit info for operational
+    support) and ESM §6/§7 (security audit trail, ethical review evidence).
+
+    NOTE on GDPR interaction: when a user exercises their right to erasure
+    via DELETE /api/v1/me/data, their LogoGeneration rows are hard-deleted,
+    but their AuditLog rows are anonymised (user_id → 'deleted-user') rather
+    than removed. Security/compliance audit trails are typically retained
+    under GDPR Art. 17(3)(b) (legal-obligation exemption) even after erasure
+    of the underlying personal data.
+    """
+    __tablename__ = "audit_logs"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    event_type: Mapped[str] = mapped_column(String(50), index=True)
+    user_id: Mapped[Optional[str]] = mapped_column(String(255), nullable=True, index=True)
+    ip_hash: Mapped[Optional[str]] = mapped_column(String(16), nullable=True)
+    brand_name: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    generator: Mapped[Optional[str]] = mapped_column(String(50), nullable=True)
+    moderation_flagged: Mapped[Optional[bool]] = mapped_column(Boolean, nullable=True)
+    moderation_categories: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    cost_usd: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    detail: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=func.now(), index=True)
 
 
 async def init_db():
