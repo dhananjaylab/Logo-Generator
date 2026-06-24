@@ -1,17 +1,36 @@
 """
-Observability and metrics collection for Logo Generator.
-Tracks queue depth, generation latency, R2 uploads, and error rates.
+Observability support utilities.
+
+P3.5 FIX (MED-01) — Removed duplicate metrics system.
+─────────────────────────────────────────────────────
+This module previously maintained a parallel in-process `MetricsCollector`
+(a dict-of-lists, memory-only, 1-hour retention, never exposed externally,
+never aggregated across worker processes) that duplicated every measurement
+already tracked by the proper Prometheus counters and histograms defined in
+prom_metrics.py. That duplication wasted memory on every request, doubled
+the instrumentation call sites that needed updating for any metric change,
+and created real ambiguity for contributors about which system was
+authoritative — the answer was always prom_metrics.py, since that's the only
+one actually scraped by Prometheus via GET /metrics.
+
+The custom MetricsCollector, Metric dataclass, MetricType enum, and all
+record_*() helper functions have been deleted entirely. Nothing in the
+codebase called them outside of metrics_middleware itself, so removal is a
+clean cut with no follow-on changes required elsewhere.
+
+What remains, and why:
+  - request_id_ctx: an async ContextVar read by `RequestIDFilter` in
+    logging_config.py so every log line can be correlated with the HTTP
+    request that produced it. This is genuinely cross-cutting context-var
+    plumbing, not a metric, so it stays here.
+  - metrics_middleware: FastAPI HTTP middleware that records request count
+    and latency directly into the Prometheus counters/histograms — no
+    intermediate in-process store, no duplication.
 """
 
 import time
 import logging
-import uuid
 from contextvars import ContextVar
-from datetime import datetime, timedelta
-from collections import defaultdict
-from typing import Dict, Optional
-from dataclasses import dataclass, field
-from enum import Enum
 
 from prom_metrics import http_requests_total, http_request_duration_seconds
 
@@ -22,193 +41,17 @@ logger = logging.getLogger(__name__)
 request_id_ctx: ContextVar[str] = ContextVar("request_id", default="N/A")
 
 
-class MetricType(str, Enum):
-    """Types of metrics we track"""
-    COUNTER = "counter"      # Increment only
-    GAUGE = "gauge"          # Point-in-time value
-    HISTOGRAM = "histogram"  # Distribution
-    TIMER = "timer"          # Duration
-
-
-@dataclass
-class Metric:
-    """Single metric data point"""
-    name: str
-    value: float
-    type: MetricType
-    timestamp: datetime = field(default_factory=datetime.utcnow)
-    labels: Dict[str, str] = field(default_factory=dict)
-    
-    def __str__(self):
-        label_str = ",".join(f"{k}={v}" for k, v in self.labels.items())
-        return f"{self.name}{{{label_str}}} = {self.value} @ {self.timestamp.isoformat()}"
-
-
-class MetricsCollector:
-    """Centralized metrics collection"""
-    
-    def __init__(self):
-        self.metrics: Dict[str, list] = defaultdict(list)
-        self.timers: Dict[str, float] = {}
-        self.retention_seconds = 3600  # Keep 1 hour of metrics
-        
-    def start_timer(self, name: str) -> str:
-        """Start a named timer, return timer_id"""
-        timer_id = f"{name}_{uuid.uuid4().hex}"
-        self.timers[timer_id] = time.time()
-        return timer_id
-    
-    def end_timer(self, timer_id: str) -> Optional[float]:
-        """End a timer, return elapsed seconds"""
-        if timer_id not in self.timers:
-            logger.warning(f"Timer {timer_id} not found")
-            return None
-        elapsed = time.time() - self.timers.pop(timer_id)
-        return elapsed
-    
-    def record_metric(
-        self,
-        name: str,
-        value: float,
-        metric_type: MetricType = MetricType.GAUGE,
-        labels: Optional[Dict[str, str]] = None
-    ):
-        """Record a metric"""
-        metric = Metric(name, value, metric_type, labels=labels or {})
-        self.metrics[name].append(metric)
-        self._cleanup_old_metrics(name)
-        return metric
-    
-    def _cleanup_old_metrics(self, name: str):
-        """Remove metrics older than retention period"""
-        now = datetime.utcnow()
-        cutoff = now - timedelta(seconds=self.retention_seconds)
-        self.metrics[name] = [
-            m for m in self.metrics[name]
-            if m.timestamp > cutoff
-        ]
-    
-    def get_metric_summary(self, name: str) -> Dict[str, float]:
-        """Get summary statistics for a metric"""
-        if name not in self.metrics or not self.metrics[name]:
-            return {}
-        
-        values = [m.value for m in self.metrics[name]]
-        return {
-            "count": len(values),
-            "min": min(values),
-            "max": max(values),
-            "avg": sum(values) / len(values),
-            "latest": values[-1] if values else 0,
-        }
-    
-    def export_prometheus(self) -> str:
-        """Export metrics in Prometheus format"""
-        lines = []
-        for name, metrics in self.metrics.items():
-            if not metrics:
-                continue
-            
-            latest = metrics[-1]
-            label_str = ",".join(f'{k}="{v}"' for k, v in latest.labels.items())
-            if label_str:
-                lines.append(f'{name}{{{label_str}}} {latest.value}')
-            else:
-                lines.append(f'{name} {latest.value}')
-        
-        return "\n".join(lines)
-
-
-# Global metrics collector instance
-metrics = MetricsCollector()
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Built-in Metrics
-# ─────────────────────────────────────────────────────────────────────────────
-
-def record_generation_start(generator: str, user_id: str):
-    """Record generation request start"""
-    metrics.record_metric(
-        "generation_requests_total",
-        1,
-        MetricType.COUNTER,
-        labels={"generator": generator, "user": user_id}
-    )
-
-
-def record_generation_latency(duration_seconds: float, generator: str, status: str):
-    """Record generation latency"""
-    metrics.record_metric(
-        "generation_latency_seconds",
-        duration_seconds,
-        MetricType.HISTOGRAM,
-        labels={"generator": generator, "status": status}
-    )
-
-
-def record_r2_upload(duration_seconds: float, success: bool, size_mb: float):
-    """Record R2 upload metrics"""
-    metrics.record_metric(
-        "r2_upload_latency_seconds",
-        duration_seconds,
-        MetricType.TIMER,
-        labels={"status": "success" if success else "failed"}
-    )
-    metrics.record_metric(
-        "r2_upload_size_mb",
-        size_mb,
-        MetricType.GAUGE,
-        labels={"status": "success" if success else "failed"}
-    )
-
-
-def record_queue_depth(queue_name: str, depth: int):
-    """Record current queue depth"""
-    metrics.record_metric(
-        "queue_depth",
-        depth,
-        MetricType.GAUGE,
-        labels={"queue": queue_name}
-    )
-
-
-def record_error(error_type: str, source: str):
-    """Record error occurrence"""
-    metrics.record_metric(
-        "errors_total",
-        1,
-        MetricType.COUNTER,
-        labels={"type": error_type, "source": source}
-    )
-
-
-def record_cache_hit(cache_name: str, hit: bool):
-    """Record cache hit/miss"""
-    metrics.record_metric(
-        "cache_hits_total" if hit else "cache_misses_total",
-        1,
-        MetricType.COUNTER,
-        labels={"cache": cache_name}
-    )
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Async Metrics Middleware (for FastAPI)
-# ─────────────────────────────────────────────────────────────────────────────
-
 async def metrics_middleware(request, call_next):
     """
-    FastAPI middleware to record request metrics.
+    FastAPI middleware recording request count/latency directly to Prometheus.
     Usage: app.middleware("http")(metrics_middleware)
     """
     start_time = time.time()
-    
-    # Get or create request ID
+
     request_id = request.headers.get("x-request-id", f"req_{id(request)}")
     request.state.request_id = request_id
     request_id_ctx.set(request_id)   # ← inject into logging context
-    
+
     try:
         response = await call_next(request)
         duration = time.time() - start_time
@@ -223,32 +66,10 @@ async def metrics_middleware(request, call_next):
             path=request.url.path,
             status=str(response.status_code),
         ).observe(duration)
-        
-        # Record HTTP metrics
-        metrics.record_metric(
-            "http_requests_total",
-            1,
-            MetricType.COUNTER,
-            labels={
-                "method": request.method,
-                "path": request.url.path,
-                "status": response.status_code
-            }
-        )
-        
-        metrics.record_metric(
-            "http_request_duration_seconds",
-            duration,
-            MetricType.TIMER,
-            labels={
-                "method": request.method,
-                "path": request.url.path,
-                "status": response.status_code
-            }
-        )
-        
+
         return response
-    except Exception as e:
+
+    except Exception as exc:
         duration = time.time() - start_time
         http_requests_total.labels(
             method=request.method,
@@ -260,15 +81,7 @@ async def metrics_middleware(request, call_next):
             path=request.url.path,
             status="error",
         ).observe(duration)
-        metrics.record_metric(
-            "http_requests_total",
-            1,
-            MetricType.COUNTER,
-            labels={
-                "method": request.method,
-                "path": request.url.path,
-                "status": "error"
-            }
+        logger.error(
+            f"[Metrics] Unhandled exception in {request.method} {request.url.path}: {exc}"
         )
-        record_error(type(e).__name__, request.url.path)
         raise

@@ -15,7 +15,7 @@
       }
     ]
   },
-  "description": "Stakeholder-friendly overview of traffic, latency, reliability, readiness, and capacity. Show trends over time and keep the board focused on a few clear signals.",
+  "description": "Stakeholder-friendly overview of traffic, latency, reliability, readiness, capacity, and cost. Show trends over time and keep the board focused on a few clear signals.",
   "editable": true,
   "fiscalYearStartMonth": 0,
   "graphTooltip": 1,
@@ -315,6 +315,110 @@
           "sort": "none"
         }
       }
+    },
+    {
+      "id": 6,
+      "title": "Cost: Estimated Spend by Generator",
+      "description": "P3.2 — cumulative estimated USD spend, derived from logoforge_generation_cost_usd_total. Estimates only, not exact billing reconciliation — see config.GENERATION_COST_USD.",
+      "type": "timeseries",
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 24
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (generator) (logoforge_generation_cost_usd_total)",
+          "legendFormat": "cumulative {{generator}}"
+        },
+        {
+          "refId": "B",
+          "expr": "sum by (generator) (rate(logoforge_generation_cost_usd_total[1h])) * 3600",
+          "legendFormat": "hourly rate {{generator}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "currencyUSD",
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "smooth",
+            "lineWidth": 2,
+            "fillOpacity": 8,
+            "showPoints": "never",
+            "spanNulls": true
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "calcs": ["last"]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      }
+    },
+    {
+      "id": 7,
+      "title": "Safety: Content Moderation Blocks",
+      "description": "P3.1 — generation requests blocked by content moderation, broken out by category.",
+      "type": "timeseries",
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 24
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (category) (rate(logoforge_moderation_blocked_total[1h])) * 3600",
+          "legendFormat": "{{category}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "custom": {
+            "drawStyle": "bars",
+            "lineWidth": 1,
+            "fillOpacity": 60,
+            "showPoints": "never",
+            "spanNulls": true,
+            "stacking": {
+              "mode": "normal",
+              "group": "A"
+            }
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "calcs": []
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      }
     }
   ],
   "refresh": "30s",
@@ -364,6 +468,6 @@
   "timezone": "browser",
   "title": "LogoForge AI - Stakeholder Overview",
   "uid": "logoforge-stakeholder-overview",
-  "version": 1,
+  "version": 2,
   "weekStart": ""
 }

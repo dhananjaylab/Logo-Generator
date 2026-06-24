@@ -1,3 +1,4 @@
+from dataclasses import dataclass
 from pydantic import BaseModel, Field
 from typing import Optional, List
 from datetime import datetime
@@ -63,13 +64,13 @@ class JobStatusResponse(BaseModel):
 
 
 # SECURITY FIX (P1.6): Scoped history response model.
-# The full LogoGeneration ORM object contains ip_hash and user_id which
-# must never be returned to clients. This model whitelists only the fields
-# that are safe to expose. FastAPI will serialize ONLY these fields.
+# The full LogoGeneration ORM object contains ip_hash, user_id, and cost_usd
+# which must never be returned to clients. This model whitelists only the
+# fields that are safe to expose. FastAPI will serialize ONLY these fields.
 class HistoryEntryResponse(BaseModel):
     """
     Safe public representation of a generation history entry.
-    Explicitly excludes: ip_hash, user_id.
+    Explicitly excludes: ip_hash, user_id, cost_usd.
     """
     id: int
     brand_name: str
@@ -90,3 +91,44 @@ class WsTicketResponse(BaseModel):
     """Short-lived WebSocket authentication ticket."""
     ticket: str = Field(..., description="Single-use ticket (URL-safe, 32 random bytes)")
     expires_in: int = Field(30, description="Ticket TTL in seconds")
+
+
+# P3.3 — GDPR/CCPA right-to-deletion response.
+class DataDeletionResponse(BaseModel):
+    """Response for DELETE /api/v1/me/data."""
+    deleted_generations: int = Field(..., description="Number of generation records deleted")
+    deleted_images: int = Field(..., description="Number of R2 image objects removed (best-effort)")
+    message: str = Field(..., description="Human-readable confirmation message")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# P3.6 — Explicit generation parameter object (MED-02 fix)
+# ─────────────────────────────────────────────────────────────────────────────
+#
+# Previously, services.py used **kwargs.pop(...) chains in both
+# generate_logo_with_openai_image() and generate_logo_with_gemini(), and the
+# Gemini quota-fallback path manually rebuilt a separate `fallback_kwargs`
+# dict by hand to call the OpenAI path. Any drift in pop ordering between the
+# two methods could raise a silent KeyError, or produce an "Unexpected
+# kwargs" warning if a key was popped in one method but not forwarded in the
+# fallback dict.
+#
+# This plain dataclass (not a Pydantic model — it's an internal service-layer
+# contract, not API surface) is now the single object passed to BOTH
+# generation methods. The Gemini→OpenAI fallback path simply forwards the
+# same `params` instance unchanged, eliminating the manual dict reconstruction
+# entirely.
+@dataclass
+class LogoGenerationParams:
+    """Internal parameter object shared by every LLMService generation method."""
+    text: str = "logo"
+    description: str = ""
+    style: str = "minimalist"
+    palette: str = "monochrome"
+    tagline: str = ""
+    typography: str = ""
+    elements_to_include: str = ""
+    elements_to_avoid: str = ""
+    brand_mission: str = ""
+    variation_hint: str = ""
+    variation_index: int = 0
