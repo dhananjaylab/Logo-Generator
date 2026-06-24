@@ -454,7 +454,10 @@ export default function LogoForge() {
 
       <footer className={styles.footer}>
         <div><Sparkles size={14} style={{ verticalAlign: 'middle', marginRight: '4px' }} /> LogoForge React Engine</div>
-        <div>System: Online | API: Default</div>
+        <div style={{ display: 'flex', gap: '1rem', alignItems: 'center' }}>
+          <a href="/privacy" style={{ opacity: 0.7 }}>Privacy &amp; Data</a>
+          <span>System: Online | API: Default</span>
+        </div>
       </footer>
     </div>
   );
