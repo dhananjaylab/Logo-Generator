@@ -6,11 +6,16 @@ from datetime import datetime, timezone
 
 from config import REDIS_SETTINGS
 from database import AsyncSessionLocal
-from prom_metrics import generation_requests, generation_latency, errors_total, job_retries_total, dlq_jobs_total, worker_max_jobs
-from repository import LogoRepository
+from prom_metrics import (
+    generation_requests, generation_latency, errors_total,
+    job_retries_total, dlq_jobs_total, worker_max_jobs,
+    generation_cost_usd_total,   # P3.2
+)
+from repository import LogoRepository, AuditRepository   # P3.4
 from services import LLMService
 from dependencies import Clients
-from circuit_breaker import close_all as close_circuit_breakers  # P2 — cleanup
+from models import LogoGenerationParams   # P3.6
+from circuit_breaker import close_all as close_circuit_breakers
 
 logger = logging.getLogger(__name__)
 
@@ -59,26 +64,38 @@ def _is_final_attempt(ctx) -> bool:
 async def generate_openai_image_task(ctx, user_ip: str, user_id: str, **kwargs):
     """
     Background task to generate a logo using the GPT image model.
-    Uses LLMService stored in ARQ context for connection reuse.
-    Publishes completion event to Redis for WebSocket subscribers.
+
+    P3.6: kwargs from the ARQ job (text, description, style, ... — exactly the
+    fields enqueued in routers.py) are wrapped into a single LogoGenerationParams
+    dataclass and passed as one object to LLMService, instead of being forwarded
+    as raw **kwargs.
     """
     llm = ctx.get("llm_openai_image") if hasattr(ctx, "get") else None
-
     if not llm:
         openai_client = Clients.get_openai_client()
         repo = LogoRepository(AsyncSessionLocal)
         llm = LLMService(None, openai_client, repository=repo)
+
+    audit = ctx.get("audit_repo") if hasattr(ctx, "get") else None
+    if not audit:
+        audit = AuditRepository(AsyncSessionLocal)
 
     job_id = ctx.get("job_id")
     redis  = ctx.get("redis")
     generation_requests.labels(generator="gpt-image-2-2026-04-21").inc()
     started = time.perf_counter()
 
-    logger.info(f"[OpenAI Image Worker] Starting generation for '{kwargs.get('text')}' (job={job_id})")
+    params = LogoGenerationParams(**kwargs)
+
+    logger.info(f"[OpenAI Image Worker] Starting generation for '{params.text}' (job={job_id})")
 
     try:
-        path, prompt = await llm.generate_logo_with_openai_image(user_ip=user_ip, user_id=user_id, **kwargs)
+        path, prompt, cost = await llm.generate_logo_with_openai_image(
+            params, user_id=user_id, user_ip=user_ip
+        )
         result = {"result": [path], "generator": "gpt-image-2-2026-04-21", "prompt": prompt, "status": "completed"}
+
+        generation_cost_usd_total.labels(generator="gpt-image-2-2026-04-21").inc(cost)
 
         if job_id and redis:
             event = json.dumps({
@@ -88,9 +105,9 @@ async def generate_openai_image_task(ctx, user_ip: str, user_id: str, **kwargs):
                     "result":    result["result"],
                     "generator": result["generator"],
                     "prompt":    result["prompt"],
-                    "brand":     kwargs.get("text"),
-                    "style":     kwargs.get("style"),
-                    "palette":   kwargs.get("palette"),
+                    "brand":     params.text,
+                    "style":     params.style,
+                    "palette":   params.palette,
                 },
             })
             await redis.publish(f"job:complete:{job_id}", event)
@@ -98,6 +115,17 @@ async def generate_openai_image_task(ctx, user_ip: str, user_id: str, **kwargs):
         generation_latency.labels(generator="gpt-image-2-2026-04-21", status="success").observe(
             time.perf_counter() - started
         )
+
+        await audit.log(
+            event_type="generation_completed",
+            user_id=user_id,
+            ip_hash=user_ip,
+            brand_name=params.text,
+            generator="gpt-image-2-2026-04-21",
+            cost_usd=cost,
+            detail=f"job_id={job_id}",
+        )
+
         return result
 
     except Exception as exc:
@@ -108,12 +136,20 @@ async def generate_openai_image_task(ctx, user_ip: str, user_id: str, **kwargs):
             time.perf_counter() - started
         )
         if _is_final_attempt(ctx):
-            await _handle_permanent_failure(ctx, user_id, exc, "dlq:dalle", kwargs.get("text", ""))
+            await _handle_permanent_failure(ctx, user_id, exc, "dlq:dalle", params.text)
             if job_id and redis:
                 await redis.publish(
                     f"job:complete:{job_id}",
                     json.dumps({"status": "failed", "error": str(exc), "user_id": user_id}),
                 )
+            await audit.log(
+                event_type="generation_failed",
+                user_id=user_id,
+                ip_hash=user_ip,
+                brand_name=params.text,
+                generator="gpt-image-2-2026-04-21",
+                detail=f"job_id={job_id} error={str(exc)[:300]}",
+            )
         raise
 
 
@@ -122,14 +158,12 @@ async def startup(ctx):
     openai_client = Clients.get_openai_client()
     repo = LogoRepository(AsyncSessionLocal)
     ctx["llm_openai_image"] = LLMService(None, openai_client, repository=repo)
+    ctx["audit_repo"] = AuditRepository(AsyncSessionLocal)
     worker_max_jobs.labels(queue="openai_image_queue").set(WorkerSettings.max_jobs)
 
 
 async def shutdown(ctx):
     logger.info("[OpenAI Image Worker] Shutting down...")
-    # P2 — close the dedicated Redis connections held by circuit breakers.
-    # Without this, the event loop would log "Task destroyed but it is pending"
-    # warnings and the connections would leak until the process exits.
     await close_circuit_breakers()
     logger.info("[OpenAI Image Worker] Circuit breaker connections closed")
 

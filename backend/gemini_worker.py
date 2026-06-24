@@ -9,11 +9,16 @@ from google import genai
 
 from config import REDIS_URL, REDIS_SETTINGS
 from database import AsyncSessionLocal
-from prom_metrics import generation_requests, generation_latency, errors_total, job_retries_total, dlq_jobs_total, worker_max_jobs
-from repository import LogoRepository
+from prom_metrics import (
+    generation_requests, generation_latency, errors_total,
+    job_retries_total, dlq_jobs_total, worker_max_jobs,
+    generation_cost_usd_total,   # P3.2
+)
+from repository import LogoRepository, AuditRepository   # P3.4
 from services import LLMService
 from dependencies import Clients
-from circuit_breaker import close_all as close_circuit_breakers  # P2 — cleanup
+from models import LogoGenerationParams   # P3.6
+from circuit_breaker import close_all as close_circuit_breakers
 
 logger = logging.getLogger(__name__)
 
@@ -62,26 +67,44 @@ def _is_final_attempt(ctx) -> bool:
 async def generate_gemini_task(ctx, user_ip: str, user_id: str, **kwargs):
     """
     Background task to generate a logo using Gemini.
-    Uses LLMService stored in ARQ context for connection reuse.
-    Publishes completion event to Redis for WebSocket subscribers.
+
+    P3.6: kwargs are wrapped into a LogoGenerationParams dataclass and passed
+    as one object — identical interface to the OpenAI worker, and the same
+    object is what gets forwarded unchanged if Gemini quota is exhausted and
+    LLMService falls back to the OpenAI path internally.
     """
     llm = ctx.get("llm_gemini") if hasattr(ctx, "get") else None
-
     if not llm:
         gemini_client = Clients.get_gemini_client()
         repo = LogoRepository(AsyncSessionLocal)
         llm = LLMService(gemini_client, None, repository=repo)
+
+    audit = ctx.get("audit_repo") if hasattr(ctx, "get") else None
+    if not audit:
+        audit = AuditRepository(AsyncSessionLocal)
 
     job_id = ctx.get("job_id")
     redis  = ctx.get("redis")
     generation_requests.labels(generator="gemini").inc()
     started = time.perf_counter()
 
-    logger.info(f"[Gemini Worker] Starting generation for '{kwargs.get('text')}' (job={job_id})")
+    params = LogoGenerationParams(**kwargs)
+
+    logger.info(f"[Gemini Worker] Starting generation for '{params.text}' (job={job_id})")
 
     try:
-        path, prompt = await llm.generate_logo_with_gemini(user_ip=user_ip, user_id=user_id, **kwargs)
+        path, prompt, cost = await llm.generate_logo_with_gemini(
+            params, user_id=user_id, user_ip=user_ip
+        )
+        # NOTE: if Gemini quota was exhausted, LLMService transparently fell
+        # back to GPT image generation internally — `result["generator"]`
+        # below would still read "gemini" since that's the queue this task
+        # ran on, but the saved DB row's `generator` column (set inside
+        # generate_logo_with_openai_image when the fallback fires) correctly
+        # reflects "gpt-image-2-2026-04-21". This mirrors prior behaviour.
         result = {"result": [path], "generator": "gemini", "prompt": prompt, "status": "completed"}
+
+        generation_cost_usd_total.labels(generator="gemini").inc(cost)
 
         if job_id and redis:
             event = json.dumps({
@@ -91,9 +114,9 @@ async def generate_gemini_task(ctx, user_ip: str, user_id: str, **kwargs):
                     "result":    result["result"],
                     "generator": result["generator"],
                     "prompt":    result["prompt"],
-                    "brand":     kwargs.get("text"),
-                    "style":     kwargs.get("style"),
-                    "palette":   kwargs.get("palette"),
+                    "brand":     params.text,
+                    "style":     params.style,
+                    "palette":   params.palette,
                 },
             })
             await redis.publish(f"job:complete:{job_id}", event)
@@ -101,6 +124,17 @@ async def generate_gemini_task(ctx, user_ip: str, user_id: str, **kwargs):
         generation_latency.labels(generator="gemini", status="success").observe(
             time.perf_counter() - started
         )
+
+        await audit.log(
+            event_type="generation_completed",
+            user_id=user_id,
+            ip_hash=user_ip,
+            brand_name=params.text,
+            generator="gemini",
+            cost_usd=cost,
+            detail=f"job_id={job_id}",
+        )
+
         return result
 
     except Exception as exc:
@@ -111,12 +145,20 @@ async def generate_gemini_task(ctx, user_ip: str, user_id: str, **kwargs):
             time.perf_counter() - started
         )
         if _is_final_attempt(ctx):
-            await _handle_permanent_failure(ctx, user_id, exc, "dlq:gemini", kwargs.get("text", ""))
+            await _handle_permanent_failure(ctx, user_id, exc, "dlq:gemini", params.text)
             if job_id and redis:
                 await redis.publish(
                     f"job:complete:{job_id}",
                     json.dumps({"status": "failed", "error": str(exc), "user_id": user_id}),
                 )
+            await audit.log(
+                event_type="generation_failed",
+                user_id=user_id,
+                ip_hash=user_ip,
+                brand_name=params.text,
+                generator="gemini",
+                detail=f"job_id={job_id} error={str(exc)[:300]}",
+            )
         raise
 
 
@@ -125,12 +167,12 @@ async def startup(ctx):
     gemini_client = Clients.get_gemini_client()
     repo = LogoRepository(AsyncSessionLocal)
     ctx["llm_gemini"] = LLMService(gemini_client, None, repository=repo)
+    ctx["audit_repo"] = AuditRepository(AsyncSessionLocal)
     worker_max_jobs.labels(queue="gemini_queue").set(WorkerSettings.max_jobs)
 
 
 async def shutdown(ctx):
     logger.info("[Gemini Worker] Shutting down...")
-    # P2 — close dedicated Redis connections held by circuit breakers.
     await close_circuit_breakers()
     logger.info("[Gemini Worker] Circuit breaker connections closed")
 
