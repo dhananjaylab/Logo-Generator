@@ -11,7 +11,7 @@ LogoForge AI is a modern, high-performance web application designed to generate 
   - **Gemini**: Lightning-fast iterations directly from Google's latest vision models.
 - **Structured Customization**:
   - **Icon vs. Lettermark Modes**: Control the focus of your design.
-  - **Artistic Styles**: Minimalist, Tech, Vintage, Abstract, luxury, and more.
+  - **Artistic Styles**: Minimalist, Tech, Vintage, Abstract, Luxury, and more.
   - **Color Palettes**: Curated monochrome, ocean, sunset, forest, and neon schemes.
   - **Advanced Guidelines**: Specify taglines, typography, elements to include/avoid, and brand missions.
 - **Real-time Experience**:
@@ -20,12 +20,18 @@ LogoForge AI is a modern, high-performance web application designed to generate 
 - **Persistence**:
   - **History Gallery**: Seamlessly load and reference past generations from a PostgreSQL-backed history.
   - **Cloudflare R2 Storage**: All designs are saved securely in high-performance cloud storage.
+- **Security & Compliance**:
+  - JWT tokens held in React memory only — never localStorage.
+  - WebSocket auth via short-lived single-use tickets (not raw JWTs in URLs).
+  - IP addresses stored as salted SHA-256 hashes, never raw.
+  - Content moderation gate on every generation request (OpenAI Moderation API).
+  - GDPR / CCPA right-to-deletion endpoint with automatic data-retention purge.
 
 ---
 
 ## 🛠️ Tech Stack
 
-- **Frontend**: Next.js 15 (TypeScript, CSS Modules, Lucide React).
+- **Frontend**: Next.js 16 (TypeScript, CSS Modules, Lucide React).
 - **Backend**: FastAPI (Python 3.9+).
 - **Asynchronous Tasks**: ARQ (Redis-backed task queueing).
 - **Database**: PostgreSQL (SQLAlchemy + AsyncPG).
@@ -37,17 +43,25 @@ LogoForge AI is a modern, high-performance web application designed to generate 
 ## 🚀 Getting Started
 
 ### 1. Prerequisites
-- **Python 3.9+** and **Node.js 18+**
-- **Redis** server (Running on default port 6379)
+- **Python 3.9+** and **Node.js 20+**
+- **Redis** server (default port 6379)
 - **PostgreSQL** database
-- **Environment Keys**: Gemini API Key, OpenAI API Key, Cloudflare R2 Credentials, Clerk JWT Key.
+- **Environment Keys**: Gemini API Key, OpenAI API Key, Cloudflare R2 Credentials.
 
 ### 2. Environment Setup
-Create a `.env` file in the `backend/` directory. The app now supports the versioned API, worker tuning, and Prometheus multiprocess metrics:
+
+Create a `.env` file in the `backend/` directory by copying `.env.template`:
+
+```bash
+cp backend/.env.template backend/.env
+```
+
+Then fill in your real values. The critical variables are shown below with safe placeholder values — **never commit real secrets**.
+
 ```env
 # AI API Keys
-GEMINI_API_KEY=your_key_here
-OPENAI_API_KEY=your_key_here
+GEMINI_API_KEY=your_gemini_api_key_here
+OPENAI_API_KEY=sk-your_openai_api_key_here
 
 # Gemini model override
 GEMINI_IMAGE_MODEL=gemini-2.5-flash-image
@@ -73,60 +87,86 @@ GEMINI_WORKER_MAX_TRIES=3
 GEMINI_WORKER_TIMEOUT=60
 GEMINI_WORKER_MAX_JOBS=10
 
+# Per-user daily generation quota
+USER_DAILY_QUOTA=50
+
 # Prometheus multiprocess metrics
 PROMETHEUS_MULTIPROC_DIR=/tmp/prometheus_multiproc
 
-# Security (Development)
-DEV_TOKEN=logo-forge-dev-2026
+# Data retention (GDPR Article 5(1)(e))
+DATA_RETENTION_DAYS=365
+```
+
+#### Security variables — local development only
+
+> ⚠️ These variables must never appear in production or staging environments and must never be committed with real values.
+
+```env
+# Generate a unique value — never share or reuse:
+#   python -c "import secrets; print(secrets.token_hex(32))"
+DEV_TOKEN=replace-with-output-of-python-secrets-token-hex-32
+ALLOW_DEV_TOKEN=true
+
+# Salt for IP address pseudonymisation (GDPR / CCPA):
+#   python -c "import secrets; print(secrets.token_hex(32))"
+IP_HASH_SALT=replace-with-output-of-python-secrets-token-hex-32
 ```
 
 #### Prometheus multiprocess: Local vs Production
 
-- Local: use a writable temp folder on your machine, for example `C:\tmp\prometheus_multiproc` on Windows or `/tmp/prometheus_multiproc` on macOS/Linux.
-- Production: use a shared runtime directory or mounted volume that every API and worker process can access. Keep it outside the source tree.
-- The API server and all workers must read the same `PROMETHEUS_MULTIPROC_DIR` value for metrics aggregation to work correctly.
-- Create the directory before starting the backend processes, or have your deploy/startup script create it automatically.
-- Do not point this variable at a repo folder unless you also exclude it from version control.
+- Local: use a writable temp folder, e.g. `/tmp/prometheus_multiproc` on macOS/Linux or `C:\tmp\prometheus_multiproc` on Windows.
+- Production: use a shared runtime directory or mounted volume accessible by every API and worker process.
+- Create the directory before starting the backend:
+  ```bash
+  mkdir -p /tmp/prometheus_multiproc
+  ```
 
 ### 3. Start Backend & Workers
-In the `backend/` directory:
+
 ```bash
+cd backend
+
 # 1. Create and activate virtual environment
 python -m venv venv
-venv\Scripts\activate  # Windows
+source venv/bin/activate          # macOS / Linux
+# venv\Scripts\activate           # Windows
 
 # 2. Install dependencies
 pip install -r requirements.txt
 
-# 3. Prepare Prometheus multiprocess directory
-$env:PROMETHEUS_MULTIPROC_DIR = "$env:TEMP\prometheus_multiproc"
-New-Item -ItemType Directory -Force $env:PROMETHEUS_MULTIPROC_DIR | Out-Null
+# 3. Run database migrations
+alembic upgrade head
 
-echo $env:PROMETHEUS_MULTIPROC_DIR
-
-# 4. Start FastAPI server (in one terminal)
+# 4. Start FastAPI server (terminal 1)
 uvicorn app:app --reload --port 8000
 
-# 5. Start workers (in separate terminals)
+# 5. Start generation workers (terminals 2 and 3)
 arq openai_image_worker.WorkerSettings
 arq gemini_worker.WorkerSettings
+
+# 6. Start data-retention maintenance worker (terminal 4)
+arq maintenance_worker.WorkerSettings
 ```
+
 *API runs on: http://localhost:8000*
 
 Useful backend endpoints:
-- `GET /api/v1/health` for readiness and dependency checks
-- `GET /metrics` for Prometheus scraping
-- `GET /api/v1/admin/dlq?queue=dalle` for dead-letter inspection
+
+| Endpoint | Purpose |
+|---|---|
+| `GET /api/v1/health` | Readiness and dependency checks |
+| `GET /metrics` | Prometheus scraping |
+| `GET /api/v1/admin/dlq?queue=dalle` | Dead-letter inspection |
+| `DELETE /api/v1/me/data` | GDPR / CCPA user data erasure |
 
 ### 4. Start Frontend
-In the `next-frontend/` directory:
-```bash
-# 1. Install dependencies
-npm install
 
-# 2. Start Next.js dev server
+```bash
+cd next-frontend
+npm install
 npm run dev
 ```
+
 *Frontend runs on: http://localhost:3000*
 
 ---
@@ -139,62 +179,45 @@ LogoForge AI uses a modular, facade-based architecture to manage multiple AI gen
 
 | Module | Purpose |
 | :--- | :--- |
-| **`app.py`** | FastAPI entry point, lifespan management, and CORS configuration. |
-| **`routers.py`** | API route handlers for health checks, logo generation, DLQ inspection, and WebSocket progress streaming. |
-| **`services.py`** | The business logic layer, featuring the `LLMService` (Facade) which orchestrates `GeminiService` and `OpenAIImageService`. |
-| **`models.py`** | Pydantic models for request/response validation and type safety. |
-| **`dependencies.py`** | Managed singleton for API clients (OpenAI, Google GenAI). |
-| **`config.py`** | Centralized design tokens (styles, palettes) and prompt templates. |
-| **`database.py`** | Async SQLAlchemy setup for persistent generation history. |
-| **`repository.py`** | Persistence abstraction for saving generation history. |
-| **`circuit_breaker.py`** | Per-process circuit breakers for OpenAI, Gemini, and R2. |
-| **`prom_metrics.py`** | Shared Prometheus metric definitions for workers and API. |
-
-### 🛠️ Module Dependencies
-
-```mermaid
-graph TD
-    A[app.py] --> B[routers.py]
-    B --> C[models.py]
-    B --> D[services.py]
-    B --> E[dependencies.py]
-    D --> F[config.py]
-    D --> G[utils.py]
-    D --> H[External APIs]
-```
+| **`app.py`** | FastAPI entry point, lifespan management, Redis pool with retry, CORS. |
+| **`routers.py`** | API routes: generation, job status, history, GDPR deletion, WebSocket, DLQ. |
+| **`services.py`** | `LLMService` facade orchestrating `GeminiService` and `OpenAIImageService`. Thread-local R2 client, magic-byte image validation, cost estimation. |
+| **`models.py`** | Pydantic request/response models and `LogoGenerationParams` dataclass. |
+| **`moderation.py`** | OpenAI Moderation API gate — runs on every generation request before enqueue. |
+| **`dependencies.py`** | API client singletons (OpenAI, Gemini) and JWT/DEV_TOKEN auth dependency. |
+| **`config.py`** | Design tokens, prompt templates, cost table, data retention constant. |
+| **`database.py`** | Async SQLAlchemy setup. `LogoGeneration` and `AuditLog` ORM models. |
+| **`repository.py`** | `LogoRepository` (save, delete) and `AuditRepository` (log, anonymise). |
+| **`circuit_breaker.py`** | `RedisCircuitBreaker` — shared state across all processes via Redis keys. |
+| **`maintenance_worker.py`** | ARQ cron-only worker: daily retention purge at 03:00 UTC. |
+| **`prom_metrics.py`** | Shared Prometheus metric definitions (counters, histograms, gauges). |
+| **`observability.py`** | `request_id_ctx` ContextVar and `metrics_middleware` for HTTP instrumentation. |
+| **`logging_config.py`** | Structured JSON logging (production) / human-readable (dev), Sentry integration. |
+| **`utils.py`** | `anonymise_ip()`, `sanitize_filename()`, path helpers. |
 
 ### 🧬 Generation Flows
 
 #### GPT Image 2
-1.  **FastAPI** receives the request and validates via Pydantic.
-2.  **LLMService** builds a logo-specific prompt with hard output constraints first.
-3.  **LLMService** calls `OpenAIImageService.generate_logo()` with `model="gpt-image-2-2026-04-21"`.
-4.  The base64 image payload is decoded, uploaded to **Cloudflare R2**, and the public URL is returned.
+1. `POST /api/v1/generate` receives and validates the request.
+2. OpenAI Moderation API checks the user-supplied free-text fields.
+3. Job is enqueued to `openai_image_queue`; `job_queue:{job_id}` key written to Redis.
+4. Worker builds prompt via `build_logo_prompt()`, calls `OpenAIImageService.generate_logo()`.
+5. Base64 response is decoded, validated via magic-byte prefix check, uploaded to R2.
+6. Completion published to `job:complete:{job_id}` Redis channel; WebSocket delivers it to the client.
 
-#### Gemini (Direct)
-1.  **FastAPI** validates the request.
-2.  **LLMService** calls `GeminiService.generate_logo()` directly using the configured `GEMINI_IMAGE_MODEL` value.
-3.  The generated image is processed via **Pillow**, uploaded to **R2**, and the public link is returned.
+#### Gemini
+1–3. Same as above (moderation, enqueue, job mapping).
+4. Worker calls `GeminiService.generate_logo()`. If Gemini quota is exhausted, `LLMService` transparently falls back to the GPT Image 2 path using the same `LogoGenerationParams` object — no manual parameter reconstruction.
+5. Image bytes validated via magic-byte prefix check, uploaded to R2.
+6. Same WebSocket delivery.
 
-#### Runtime Flow
-1.  Client calls `POST /api/v1/generate`.
-2.  Backend enqueues either `generate_openai_image_task` or `generate_gemini_task` onto the matching ARQ queue.
-3.  Worker publishes completion or failure to Redis pub/sub for the WebSocket listener at `/api/v1/ws/progress/{job_id}`.
-4.  The frontend can fall back to `GET /api/v1/jobs/{job_id}` if WebSocket delivery is interrupted.
+#### Runtime fallback
+- If the WebSocket connection drops, the frontend polls `GET /api/v1/jobs/{job_id}` every 2 s, using the same `job_queue:{job_id}` O(1) lookup internally.
 
 ---
 
 ## 🧪 Testing & Diagnostics
 
-The backend includes a comprehensive test suite for validating API clients and generation pipelines.
-
-```bash
-# Run all backend unit tests
-cd backend
-python -m pytest test_backend.py -v
-```
-
-Common manual checks:
 ```bash
 # Health and readiness
 curl http://localhost:8000/api/v1/health
@@ -203,24 +226,44 @@ curl http://localhost:8000/api/v1/health
 curl http://localhost:8000/metrics
 
 # Frontend dev server
-cd next-frontend
-npm run dev
+cd next-frontend && npm run dev
 ```
+
+---
 
 ## 📊 Monitoring
 
 Stakeholder-friendly Grafana assets live in [`monitoring/`](./monitoring).
 
-- Dashboard: [`monitoring/grafana/dashboards/logoforge-stakeholder-dashboard.json`](./monitoring/grafana/dashboards/logoforge-stakeholder-dashboard.json)
-- Metrics endpoint: `GET /metrics`
-- Health endpoint: `GET /api/v1/health`
+- **Dashboard**: [`monitoring/grafana/dashboards/logoforge-stakeholder-dashboard.json`](./monitoring/grafana/dashboards/logoforge-stakeholder-dashboard.json)
+- **Metrics endpoint**: `GET /metrics`
+- **Health endpoint**: `GET /api/v1/health`
 
-The dashboard is designed around five executive questions:
-- Traffic
-- Latency
-- Reliability
-- Readiness
-- Capacity
+The dashboard covers seven panels across six operational questions:
+
+| Panel | Question |
+|---|---|
+| Traffic | How many requests is the system handling? |
+| Readiness | Are Redis, Postgres, OpenAI, and Gemini all healthy? |
+| Latency | How long do generations and R2 uploads take? |
+| Capacity | Are workers near their concurrency limits? |
+| Reliability | How often do jobs fail, retry, or hit the DLQ? |
+| Cost | What is the estimated USD spend per generator? |
+| Safety | How many requests are blocked by content moderation? |
+
+---
+
+## 🛡️ Security & Privacy
+
+| Feature | Implementation |
+|---|---|
+| JWT storage | React memory only (AuthContext) — never localStorage |
+| WebSocket auth | Short-lived single-use tickets via `POST /ws/ticket`, not raw JWTs in URLs |
+| DEV_TOKEN bypass | Blocked unconditionally in `production` and `staging` environments |
+| IP addresses | Salted SHA-256 hash (16 hex chars) — raw IP never stored or logged |
+| Content moderation | OpenAI Moderation API on every generation request, before enqueue |
+| Data retention | Configurable `DATA_RETENTION_DAYS` enforced by daily maintenance cron |
+| Right to erasure | `DELETE /api/v1/me/data` — hard-deletes rows and R2 objects, anonymises audit trail |
 
 ---
 
